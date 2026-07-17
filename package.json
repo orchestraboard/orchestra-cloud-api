@@ -1,0 +1,38 @@
+{
+  "name": "agentboard",
+  "version": "0.1.0",
+  "description": "Live kanban coordination board for Claude Code agents",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "bin": {
+    "agentboard": "./dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "web/dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsup src/cli.ts --format esm --clean --banner.js '#!/usr/bin/env node' && node scripts/fix-bin.mjs",
+    "test": "vitest run",
+    "dev": "tsx src/cli.ts serve"
+  },
+  "dependencies": {
+    "better-sqlite3": "^12.11.1",
+    "commander": "^15.0.0",
+    "fastify": "^5.10.0",
+    "picomatch": "^4.0.5"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^26.1.1",
+    "@types/picomatch": "^4.0.3",
+    "tsup": "^8.5.1",
+    "tsx": "^4.23.1",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.10"
+  }
+}
