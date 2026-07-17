@@ -16,7 +16,8 @@
     "README.md"
   ],
   "scripts": {
-    "build": "tsup src/cli.ts --format esm --clean --banner.js '#!/usr/bin/env node' && node scripts/fix-bin.mjs",
+    "build": "tsup && node scripts/fix-bin.mjs",
+    "prepack": "npm run build && cd web && npm ci && npm run build",
     "test": "vitest run",
     "dev": "tsx src/cli.ts serve"
   },
