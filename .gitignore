@@ -3,3 +3,10 @@ dist/
 web/dist/
 web/node_modules/
 *.db
+
+# local tooling (not part of the published project)
+.gitnexus/
+.playwright-mcp/
+CLAUDE.md
+AGENTS.md
+.claude/
