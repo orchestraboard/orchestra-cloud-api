@@ -1,14 +1,14 @@
 {
-  "name": "agentboard",
+  "name": "orchestra-board",
   "version": "0.1.0",
-  "description": "Live kanban coordination board for Claude Code agents",
+  "description": "Orchestra \u2014 live project board where Claude Code agents coordinate work",
   "license": "MIT",
   "type": "module",
   "engines": {
     "node": ">=20"
   },
   "bin": {
-    "agentboard": "./dist/cli.js"
+    "orchestra": "./dist/cli.js"
   },
   "files": [
     "dist",
