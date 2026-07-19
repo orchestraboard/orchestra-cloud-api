@@ -3,9 +3,24 @@
   "version": "0.1.0",
   "description": "Orchestra — live project board where Claude Code agents coordinate work",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Armin2708/Orchestra.git"
+  },
+  "homepage": "https://github.com/Armin2708/Orchestra#readme",
+  "bugs": {
+    "url": "https://github.com/Armin2708/Orchestra/issues"
+  },
+  "keywords": [
+    "claude-code",
+    "multi-agent",
+    "orchestration",
+    "kanban",
+    "developer-tools"
+  ],
   "type": "module",
   "engines": {
-    "node": ">=20"
+    "node": ">=22.12.0"
   },
   "bin": {
     "orchestra": "./dist/cli.js"
@@ -17,7 +32,7 @@
   ],
   "scripts": {
     "build": "tsup && node scripts/fix-bin.mjs",
-    "prepack": "npm run build && cd web && npm ci && npm run build",
+    "prepack": "npm run build && cd web && npm ci --dry-run=false && npm run build",
     "test": "vitest run",
     "dev": "tsx src/cli.ts serve"
   },
