@@ -35,7 +35,16 @@
     ".claude-plugin",
     ".codex-plugin",
     "environment-compatibility.json",
-    "README.md"
+    "README.md",
+    "docs/agent-os.md",
+    "docs/codex.md",
+    "docs/delivery-trackbook.md",
+    "docs/operator-preview.md",
+    "docs/remote-mobile-threat-control-matrix.json",
+    "docs/remote-mobile-threat-model.md",
+    "docs/remote-preview.md",
+    "docs/support-preview.md",
+    "docs/supported-environments.md"
   ],
   "scripts": {
     "build": "tsup && node scripts/fix-bin.mjs",
