@@ -22,7 +22,8 @@
   ],
   "type": "module",
   "engines": {
-    "node": ">=22.12.0"
+    "node": ">=22.12.0 <23",
+    "npm": ">=10.9.0 <11"
   },
   "bin": {
     "orchestra": "./dist/cli.js"
@@ -33,7 +34,17 @@
     "hooks",
     ".claude-plugin",
     ".codex-plugin",
-    "README.md"
+    "environment-compatibility.json",
+    "README.md",
+    "docs/agent-os.md",
+    "docs/codex.md",
+    "docs/delivery-trackbook.md",
+    "docs/operator-preview.md",
+    "docs/remote-mobile-threat-control-matrix.json",
+    "docs/remote-mobile-threat-model.md",
+    "docs/remote-preview.md",
+    "docs/support-preview.md",
+    "docs/supported-environments.md"
   ],
   "scripts": {
     "build": "tsup && node scripts/fix-bin.mjs",
@@ -43,8 +54,8 @@
     "dev": "tsx src/cli.ts serve"
   },
   "dependencies": {
-    "@anthropic-ai/claude-agent-sdk": "^0.3.212",
-    "@fastify/static": "^10.1.0",
+    "@anthropic-ai/claude-agent-sdk": "0.3.212",
+    "@fastify/static": "^10.1.2",
     "better-sqlite3": "^12.11.1",
     "commander": "^15.0.0",
     "fastify": "^5.10.0",
