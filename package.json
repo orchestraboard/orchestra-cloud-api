@@ -36,6 +36,8 @@
     ".codex-plugin",
     "environment-compatibility.json",
     "README.md",
+    "docs/agent-os-migration-controls.json",
+    "docs/agent-os-migration-controls.md",
     "docs/agent-os.md",
     "docs/codex.md",
     "docs/delivery-trackbook.md",
