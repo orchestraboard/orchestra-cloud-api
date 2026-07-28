@@ -49,6 +49,7 @@
     "docs/supported-environments.md"
   ],
   "scripts": {
+    "baseline:agent-os": "node scripts/capture-agent-os-baseline.mjs",
     "build": "tsup && node scripts/fix-bin.mjs",
     "accept:codex": "tsx src/provider-acceptance-cli.ts",
     "check:codex-protocol": "node scripts/check-codex-protocol.mjs",
