@@ -36,6 +36,7 @@
     ".codex-plugin",
     "environment-compatibility.json",
     "README.md",
+    "docs/agent-os-compatibility-projections.md",
     "docs/agent-os-current-baseline.json",
     "docs/agent-os-current-baseline.md",
     "docs/agent-os-migration-controls.json",
