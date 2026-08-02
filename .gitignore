@@ -3,6 +3,7 @@ dist/
 web/dist/
 web/node_modules/
 *.db
+artifacts/qa/browser-quality/
 
 # local tooling (not part of the published project)
 .gitnexus/
