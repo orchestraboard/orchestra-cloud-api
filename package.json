@@ -36,6 +36,7 @@
     ".codex-plugin",
     "environment-compatibility.json",
     "README.md",
+    "docs",
     "docs/agent-os-compatibility-projections.md",
     "docs/agent-os-forward-migrations.md",
     "docs/agent-os-current-baseline.json",
@@ -47,15 +48,21 @@
     "docs/codex.md",
     "docs/delivery-trackbook.md",
     "docs/operator-preview.md",
+    "docs/provider-subscription-strategy.md",
     "docs/remote-mobile-threat-control-matrix.json",
     "docs/remote-mobile-threat-model.md",
     "docs/remote-preview.md",
     "docs/support-preview.md",
-    "docs/supported-environments.md"
+    "docs/supported-environments.md",
+    "docs/token-diet.md",
+    "docs/beta-release-operations.md",
+    "scripts/beta-release-contract.json"
   ],
   "scripts": {
     "baseline:agent-os": "node scripts/capture-agent-os-baseline.mjs",
     "build": "tsup && node scripts/fix-bin.mjs",
+    "package:artifact": "node scripts/package-install-smoke.mjs",
+    "release:contract": "node scripts/verify-beta-release-contract.mjs",
     "accept:codex": "tsx src/provider-acceptance-cli.ts",
     "check:codex-protocol": "node scripts/check-codex-protocol.mjs",
     "prepack": "npm run build && cd web && npm ci --dry-run=false && npm run build",
@@ -65,6 +72,7 @@
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "0.3.212",
     "@fastify/static": "^10.1.2",
+    "@modelcontextprotocol/sdk": "1.30.0",
     "better-sqlite3": "^12.11.1",
     "commander": "^15.0.0",
     "fastify": "^5.10.0",
@@ -74,7 +82,8 @@
     "web-push": "^3.6.7"
   },
   "overrides": {
-    "esbuild": "0.28.1"
+    "esbuild": "0.28.1",
+    "@hono/node-server": "2.0.10"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",
