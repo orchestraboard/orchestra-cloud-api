@@ -22,8 +22,8 @@
   ],
   "type": "module",
   "engines": {
-    "node": ">=22.12.0 <23",
-    "npm": ">=10.9.0 <11"
+    "node": ">=22.20.0 <23",
+    "npm": ">=10.9.3 <11"
   },
   "bin": {
     "orchestra": "./dist/cli.js"
@@ -36,7 +36,6 @@
     ".codex-plugin",
     "environment-compatibility.json",
     "README.md",
-    "docs",
     "docs/agent-os-compatibility-projections.md",
     "docs/agent-os-forward-migrations.md",
     "docs/agent-os-current-baseline.json",
