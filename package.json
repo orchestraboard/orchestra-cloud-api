@@ -72,7 +72,10 @@
     "scripts/beta-release-contract.json",
     "scripts/beta-dogfood-plan.json",
     "scripts/exact-commit-contract.mjs",
-    "scripts/run-beta-dogfood.mjs"
+    "scripts/package-source-identity.mjs",
+    "scripts/retained-package-artifact.mjs",
+    "scripts/run-beta-dogfood.mjs",
+    "scripts/tar-artifact-integrity.mjs"
   ],
   "scripts": {
     "baseline:agent-os": "node scripts/capture-agent-os-baseline.mjs",
