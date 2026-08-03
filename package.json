@@ -61,6 +61,7 @@
     "docs/data-recovery.md",
     "docs/getting-started.md",
     "docs/lifecycle-demo.md",
+    "docs/qa016-dogfood.md",
     "docs/remote-access-security.md",
     "docs/telemetry-support.md",
     "docs/troubleshooting.md",
@@ -68,7 +69,9 @@
     "scripts/backup-orchestra-state.sh",
     "scripts/outcome-benchmark.mjs",
     "scripts/beta-release-monitor.mjs",
-    "scripts/beta-release-contract.json"
+    "scripts/beta-release-contract.json",
+    "scripts/beta-dogfood-plan.json",
+    "scripts/run-beta-dogfood.mjs"
   ],
   "scripts": {
     "baseline:agent-os": "node scripts/capture-agent-os-baseline.mjs",
@@ -79,6 +82,7 @@
     "release:contract": "node scripts/verify-beta-release-contract.mjs",
     "release:preflight": "node scripts/beta-release-preflight.mjs",
     "release:platform": "node scripts/validate-beta-platform-lifecycle.mjs",
+    "quality:dogfood": "node scripts/run-beta-dogfood.mjs",
     "accept:codex": "tsx src/provider-acceptance-cli.ts",
     "check:codex-app-server": "node scripts/check-codex-app-server-contract.mjs",
     "check:codex-protocol": "node scripts/check-codex-protocol.mjs",
