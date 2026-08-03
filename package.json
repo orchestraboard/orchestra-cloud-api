@@ -71,6 +71,8 @@
     "build": "tsup && node scripts/fix-bin.mjs",
     "package:artifact": "node scripts/package-install-smoke.mjs",
     "release:contract": "node scripts/verify-beta-release-contract.mjs",
+    "release:preflight": "node scripts/beta-release-preflight.mjs",
+    "release:platform": "node scripts/validate-beta-platform-lifecycle.mjs",
     "accept:codex": "tsx src/provider-acceptance-cli.ts",
     "check:codex-protocol": "node scripts/check-codex-protocol.mjs",
     "prepack": "npm run build && cd web && npm ci --dry-run=false && npm run build",
