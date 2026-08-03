@@ -71,6 +71,7 @@
     "scripts/beta-release-monitor.mjs",
     "scripts/beta-release-contract.json",
     "scripts/beta-dogfood-plan.json",
+    "scripts/exact-commit-contract.mjs",
     "scripts/run-beta-dogfood.mjs"
   ],
   "scripts": {
