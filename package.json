@@ -74,6 +74,7 @@
     "release:preflight": "node scripts/beta-release-preflight.mjs",
     "release:platform": "node scripts/validate-beta-platform-lifecycle.mjs",
     "accept:codex": "tsx src/provider-acceptance-cli.ts",
+    "check:codex-app-server": "node scripts/check-codex-app-server-contract.mjs",
     "check:codex-protocol": "node scripts/check-codex-protocol.mjs",
     "prepack": "npm run build && cd web && npm ci --dry-run=false && npm run build",
     "test": "vitest run",
