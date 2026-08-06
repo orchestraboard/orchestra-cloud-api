@@ -92,7 +92,8 @@
     "check:codex-protocol": "node scripts/check-codex-protocol.mjs",
     "prepack": "npm run build && cd web && npm ci --dry-run=false && npm run build",
     "test": "vitest run",
-    "dev": "tsx src/cli.ts serve"
+    "dev": "tsx src/cli.ts serve",
+    "check:provider-catalog": "node scripts/check-provider-catalog.mjs"
   },
   "dependencies": {
     "@agentclientprotocol/sdk": "0.23.0",
