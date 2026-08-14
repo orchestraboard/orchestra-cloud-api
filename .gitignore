@@ -11,3 +11,10 @@ artifacts/qa/browser-quality/
 CLAUDE.md
 AGENTS.md
 .claude/
+
+# review evidence: screenshots agents attach to completion mails. Untracked source hiding
+# among these once broke main (an unnoticed driver was never committed), so they are ignored
+# and `git status` stays a signal.
+/*.png
+/*.jpeg
+/*.jpg
