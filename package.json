@@ -2,7 +2,7 @@
   "name": "orchestra-board",
   "version": "0.1.0",
   "description": "Orchestra — live project board where Claude Code and Codex agents coordinate work",
-  "license": "MIT",
+  "license": "FSL-1.1-ALv2",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/Armin2708/Orchestra.git"
