@@ -32,6 +32,7 @@
     "dist",
     "web/dist",
     "hooks",
+    "workflows",
     ".claude-plugin",
     ".codex-plugin",
     "environment-compatibility.json",
