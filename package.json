@@ -26,7 +26,7 @@
     "npm": ">=10.9.3 <11"
   },
   "bin": {
-    "orchestra": "./dist/cli.js"
+    "orchestra": "dist/cli.js"
   },
   "files": [
     "dist",
