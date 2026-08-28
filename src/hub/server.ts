@@ -265,12 +265,20 @@ export function buildHubServer(sql: HubSqlPool, opts: HubServerOptions = {}): Fa
       sql.query<{ n: string }>("SELECT count(*)::text AS n FROM agents WHERE org_id = $1 AND state <> 'offline'", [orgId]),
       sql.query<{ tier: string }>('SELECT tier FROM subscriptions WHERE org_id = $1', [orgId]),
     ])
+    const seatsUsed = Number(memberships.rows[0]?.n ?? 0)
+    const agentsUsed = Number(agents.rows[0]?.n ?? 0)
     return reply.send({
       tier: subscription.rows[0]?.tier ?? 'none',
       status: entitlement.status,
       sso: entitlement.sso,
-      seats: { used: Number(memberships.rows[0]?.n ?? 0), entitled: entitlement.seats },
-      agents: { used: Number(agents.rows[0]?.n ?? 0), entitled: entitlement.concurrentAgents },
+      // `overCap` on seats: memberships are never gated at creation (Clerk owns
+      // membership truth — see entitlements.ts's assertSeatAvailable doc comment),
+      // only at device-token minting, so a membership count above `entitled` is an
+      // expected, visible state, not a bug — this is what lets the UI prompt an
+      // upgrade instead of a member only discovering the cap when their daemon
+      // pairing is refused.
+      seats: { used: seatsUsed, entitled: entitlement.seats, overCap: seatsUsed > entitlement.seats },
+      agents: { used: agentsUsed, entitled: entitlement.concurrentAgents, overCap: agentsUsed > entitlement.concurrentAgents },
     })
   })
 

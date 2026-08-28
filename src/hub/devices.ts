@@ -1,6 +1,7 @@
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
+import { assertSeatAvailable } from './entitlements.js'
 import { ForbiddenError, NotFoundError } from './errors.js'
-import type { HubSql } from './sql.js'
+import { withTransaction, type HubSql, type HubSqlPool } from './sql.js'
 import { boundedString } from './validate.js'
 
 /** Exported so server.ts can discriminate device vs. Clerk tokens by shape alone, with no lookup. */
@@ -25,20 +26,42 @@ export interface MintDeviceInput {
 /**
  * Returns the plaintext token exactly once — only its SHA-256 is stored, so a
  * database read cannot impersonate a daemon.
+ *
+ * The seat cap is enforced HERE, not on membership creation — see
+ * `assertSeatAvailable`'s doc comment (entitlements.ts) for why a member Clerk has
+ * already admitted is never retroactively disabled. When `input.membershipId` is
+ * given, only the first N members (by join order) may mint a device token; everyone
+ * else can still sign in and view the board, just not connect a daemon. Callers with
+ * no membership behind the token (`membershipId` omitted — every pre-existing
+ * caller/test) are unaffected.
+ *
+ * Locks the org row for the duration of this transaction, the same pattern (and for
+ * the same reason) as `registerAgent`'s concurrent-agent-capacity check in
+ * presence.ts: without it, two concurrent mints for two different memberships that
+ * would each individually rank within the seat cap could both read "under cap" and
+ * both commit, handing out one more connected daemon than the org paid for.
  */
 export async function mintDeviceToken(
-  sql: HubSql, input: MintDeviceInput,
+  sql: HubSqlPool, input: MintDeviceInput,
 ): Promise<{ device: HubDevice; token: string }> {
   const name = boundedString(input.name, 'name', 120)
   const token = `${TOKEN_PREFIX}${randomBytes(32).toString('base64url')}`
 
-  const inserted = await sql.query<HubDevice>(
-    `INSERT INTO devices (id, org_id, membership_id, name, token_hash)
-     VALUES ($1, $2, $3, $4, $5)
-     RETURNING id, org_id, membership_id, name, last_seen_at, revoked_at`,
-    [`dev_${randomUUID()}`, input.orgId, input.membershipId ?? null, name, hashToken(token)],
-  )
-  return { device: inserted.rows[0], token }
+  return withTransaction(sql, async (tx) => {
+    await tx.query('SELECT id FROM orgs WHERE id = $1 FOR UPDATE', [input.orgId])
+
+    if (input.membershipId) {
+      await assertSeatAvailable(tx, input.orgId, input.membershipId)
+    }
+
+    const inserted = await tx.query<HubDevice>(
+      `INSERT INTO devices (id, org_id, membership_id, name, token_hash)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING id, org_id, membership_id, name, last_seen_at, revoked_at`,
+      [`dev_${randomUUID()}`, input.orgId, input.membershipId ?? null, name, hashToken(token)],
+    )
+    return { device: inserted.rows[0], token }
+  })
 }
 
 /**

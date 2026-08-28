@@ -1,4 +1,4 @@
-import { ForbiddenError } from './errors.js'
+import { ForbiddenError, NotFoundError } from './errors.js'
 import type { HubSql } from './sql.js'
 
 /**
@@ -30,6 +30,14 @@ export interface EntitlementSnapshot {
   sso: boolean
   /** `orgs.status` ('active' | 'suspended') — the same field `assertOrgWritable` reads. */
   status: string
+}
+
+/** `EntitlementSnapshot` plus the tier that produced it — kept internal (not part of
+ * the exported interface, which the task brief specifies without a `tier` field) but
+ * needed by `assertAgentCapacity` to phrase a tier-aware error, and by
+ * `GET /entitlements` (server.ts) for its "current plan" display. */
+interface EntitlementDetail extends EntitlementSnapshot {
+  tier: 'cloud' | 'business' | 'none'
 }
 
 interface SubscriptionRow {
@@ -73,7 +81,7 @@ interface SubscriptionRow {
  *     own board over a Stripe data quirk), never unlimited (a never-paying org isn't
  *     handed Cloud-base-tier capacity for free), and easy to explain to support.
  */
-export async function entitlementsFor(sql: HubSql, orgId: string): Promise<EntitlementSnapshot> {
+async function resolveEntitlement(sql: HubSql, orgId: string): Promise<EntitlementDetail> {
   const orgResult = await sql.query<{ status: string; seat_cap: number }>(
     'SELECT status, seat_cap FROM orgs WHERE id = $1', [orgId],
   )
@@ -89,22 +97,35 @@ export async function entitlementsFor(sql: HubSql, orgId: string): Promise<Entit
 
   if (sub?.tier === 'business') {
     const seats = Math.max(sub.seats_purchased, BUSINESS_SEAT_MINIMUM)
-    return { seats, concurrentAgents: CLOUD_AGENTS_PER_SEAT * seats, sso: sub.sso_enabled, status }
+    return { tier: 'business', seats, concurrentAgents: CLOUD_AGENTS_PER_SEAT * seats, sso: sub.sso_enabled, status }
   }
 
   if (sub?.tier === 'cloud') {
     const seats = CLOUD_BASE_SEATS + sub.seats_purchased
     const concurrentAgents = CLOUD_AGENTS_PER_SEAT * seats + AGENTS_PER_PACK * sub.agent_packs
-    return { seats, concurrentAgents, sso: sub.sso_enabled, status }
+    return { tier: 'cloud', seats, concurrentAgents, sso: sub.sso_enabled, status }
   }
 
   // sub is undefined, or sub.tier === 'none' — see the doc comment above.
   const cachedSeats = sub ? sub.seats_included + sub.seats_purchased : 0
   if (cachedSeats > 0) {
     const concurrentAgents = CLOUD_AGENTS_PER_SEAT * cachedSeats + AGENTS_PER_PACK * (sub?.agent_packs ?? 0)
-    return { seats: cachedSeats, concurrentAgents, sso: sub?.sso_enabled ?? false, status }
+    return { tier: 'none', seats: cachedSeats, concurrentAgents, sso: sub?.sso_enabled ?? false, status }
   }
-  return { seats: fallbackSeats, concurrentAgents: CLOUD_AGENTS_PER_SEAT * fallbackSeats, sso: false, status }
+  return {
+    tier: 'none', seats: fallbackSeats, concurrentAgents: CLOUD_AGENTS_PER_SEAT * fallbackSeats,
+    sso: false, status,
+  }
+}
+
+/** Public entry point — see `resolveEntitlement`'s doc comment for the derivation
+ * rules. `tier` is deliberately omitted from the return shape (kept narrow to what
+ * the task brief specifies); callers that need it use `resolveEntitlement` directly
+ * within this module, or read the `tier` field `GET /entitlements` (server.ts)
+ * exposes over HTTP. */
+export async function entitlementsFor(sql: HubSql, orgId: string): Promise<EntitlementSnapshot> {
+  const { tier: _tier, ...snapshot } = await resolveEntitlement(sql, orgId)
+  return snapshot
 }
 
 /**
@@ -136,11 +157,14 @@ export async function assertOrgWritable(sql: HubSql, orgId: string): Promise<voi
  * `registerAgent` (presence.ts) is idempotent by (org, board, name): a daemon
  * reconnecting under a name it already registered must not be refused just because
  * the org happens to be at capacity, since that call adds no new agent. This is
- * called from inside `registerAgent`, after its existing-row check has already
- * short-circuited, so only a genuinely new agent is ever weighed against the cap.
+ * called from inside `registerAgent`'s transaction, after its existing-row check has
+ * already short-circuited AND after that transaction has locked the org row (see
+ * `registerAgent`'s own comment on the `SELECT ... FOR UPDATE`), so only a genuinely
+ * new agent is ever weighed against the cap, and two concurrent registrations for
+ * two different new names cannot both read "under cap" and both commit.
  */
 export async function assertAgentCapacity(sql: HubSql, orgId: string): Promise<void> {
-  const entitlement = await entitlementsFor(sql, orgId)
+  const entitlement = await resolveEntitlement(sql, orgId)
   const result = await sql.query<{ n: string }>(
     "SELECT count(*)::text AS n FROM agents WHERE org_id = $1 AND state <> 'offline'",
     [orgId],
@@ -149,7 +173,59 @@ export async function assertAgentCapacity(sql: HubSql, orgId: string): Promise<v
   if (liveAgents >= entitlement.concurrentAgents) {
     throw new ForbiddenError(
       `agent capacity reached: ${liveAgents}/${entitlement.concurrentAgents} concurrent agents in use — `
-      + 'buy an agent pack (+10 concurrent agents) or add seats to register more',
+      + `${capacityRemedy(entitlement.tier)}`,
+    )
+  }
+}
+
+/** Tier-aware remedy text for `assertAgentCapacity`'s error — Business has no
+ * defined agent-pack product (see `resolveEntitlement`'s doc comment), so telling a
+ * Business org to "buy an agent pack" would point at something that doesn't exist
+ * for them. `'none'` orgs aren't on a recognized paid plan at all, so the actionable
+ * step is subscribing, not adding seats to a plan they don't have. */
+function capacityRemedy(tier: 'cloud' | 'business' | 'none'): string {
+  switch (tier) {
+    case 'cloud': return 'buy an agent pack (+10 concurrent agents) or add seats to register more'
+    case 'business': return 'add seats to register more concurrent agents'
+    case 'none': return 'upgrade to a paid Cloud or Business plan to raise this limit'
+  }
+}
+
+/**
+ * Throws `ForbiddenError` when minting a new device token for `membershipId` would
+ * exceed the org's entitled seats. Ranking is by `memberships.created_at` (ties
+ * broken by `id` for a fully deterministic order) — the first N members, in join
+ * order, may connect a daemon; members beyond that get a clear refusal rather than a
+ * silent failure. This is deliberately the ONLY seat-cap enforcement point: an
+ * over-cap member is never retroactively locked out of an org they're already in
+ * (Clerk remains the source of truth for membership — see webhooks/clerk.ts, which
+ * accepts an over-cap membership rather than rejecting it) and an already-minted
+ * device keeps working even if the org later drops below its member's rank — this
+ * only gates the next NEW device pairing. A seat's real cost to this system is a
+ * connected daemon, which is exactly what this meters; everyone can still sign in
+ * and view the board regardless of rank.
+ *
+ * A no-op when `membershipId` is not given (a device with no member behind it —
+ * every existing caller/test that mints a token this way predates this check and
+ * has no membership to rank).
+ */
+export async function assertSeatAvailable(sql: HubSql, orgId: string, membershipId: string): Promise<void> {
+  const ranked = await sql.query<{ rn: string }>(
+    `WITH ranked AS (
+       SELECT id, row_number() OVER (ORDER BY created_at ASC, id ASC) AS rn
+       FROM memberships WHERE org_id = $1
+     )
+     SELECT rn::text AS rn FROM ranked WHERE id = $2`,
+    [orgId, membershipId],
+  )
+  const rank = ranked.rows[0]?.rn
+  if (rank === undefined) throw new NotFoundError('membership not found in this org')
+
+  const entitlement = await entitlementsFor(sql, orgId)
+  if (Number(rank) > entitlement.seats) {
+    throw new ForbiddenError(
+      `seat cap reached: this org is entitled to ${entitlement.seats} seat(s) and you are member #${rank} `
+      + 'by join order — buy more seats to connect a daemon (you can still sign in and view the board)',
     )
   }
 }
