@@ -14,17 +14,35 @@ export interface AppendOrgEvent {
 
 /**
  * Appends one event and allocates the org's next `seq` from `org_event_seq`.
+ *
+ * Contract: the counter bump and the `org_events` insert are two statements,
+ * not one. Callers that also mutate an entity (a card, mail, an agent row)
+ * MUST invoke this inside the same `withTransaction` as that mutation, so the
+ * entity write and the event append commit or roll back together — pass the
+ * transaction handle as `tx`. A bare call (no surrounding transaction) is only
+ * for tests and for appends with no accompanying entity mutation.
+ *
  * The idempotency replay check runs first and short-circuits before any
  * allocation, so a replayed key never burns a seq number. Allocation itself is
  * a single `INSERT ... ON CONFLICT DO UPDATE ... RETURNING`, which takes a row
  * lock on the counter row and so serialises correctly against concurrent
- * callers — whether `appendOrgEvent` is called bare or inside `withTransaction`.
- * Callers that also mutate an entity MUST wrap both in one `withTransaction`.
+ * callers.
+ *
+ * Accepted residual risk: if the process dies between the counter bump and
+ * the `org_events` insert (or a bare, non-transactional call fails between
+ * them), that seq number is burned — it is never reused, and later events
+ * keep allocating from the counter's new value. This is benign by design: it
+ * produces a gap, never a duplicate, never a lost event, and never a bad
+ * resume, because `readOrgEventsSince` reads `seq > since` ordered ascending
+ * and a number with no row is simply skipped. Do NOT "fix" gaplessness by
+ * reusing a burned number — that would let a replayed/retried append collide
+ * with an unrelated already-delivered event at the same seq, which WOULD
+ * break resume.
  */
-export async function appendOrgEvent(sql: HubSql, input: AppendOrgEvent): Promise<HubEvent> {
+export async function appendOrgEvent(tx: HubSql, input: AppendOrgEvent): Promise<HubEvent> {
   const key = input.idempotencyKey ?? null
   if (key) {
-    const existing = await sql.query<HubEvent>(
+    const existing = await tx.query<HubEvent>(
       'SELECT * FROM org_events WHERE org_id = $1 AND idempotency_key = $2',
       [input.orgId, key],
     )
@@ -36,7 +54,7 @@ export async function appendOrgEvent(sql: HubSql, input: AppendOrgEvent): Promis
     }
   }
 
-  const allocated = await sql.query<{ next_seq: string | number }>(
+  const allocated = await tx.query<{ next_seq: string | number }>(
     `INSERT INTO org_event_seq (org_id, next_seq) VALUES ($1, 1)
      ON CONFLICT (org_id) DO UPDATE SET next_seq = org_event_seq.next_seq + 1
      RETURNING next_seq`,
@@ -44,7 +62,7 @@ export async function appendOrgEvent(sql: HubSql, input: AppendOrgEvent): Promis
   )
   const seq = Number(allocated.rows[0]?.next_seq)
 
-  const inserted = await sql.query<HubEvent>(
+  const inserted = await tx.query<HubEvent>(
     `INSERT INTO org_events (id, org_id, seq, kind, board_id, actor_device_id, idempotency_key, payload)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
      RETURNING *`,
