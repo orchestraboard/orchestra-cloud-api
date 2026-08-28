@@ -356,6 +356,53 @@ describe('syncSubscriptionFromStripe', () => {
       expect(row.tier).toBe('business')
     })
 
+    /**
+     * THE test the `tier` column exists to make pass correctly. Before `tier` existed, these two
+     * subscriptions were byte-identical in every cached seat column — `seats_included: 0,
+     * seats_purchased: 10` both times — because a Cloud org buying only extra seats (no
+     * `cloud_base` line, e.g. mid-checkout, or a `cloud_base` line that expired/was removed) and
+     * a genuine Business org look the same to any seat-count-only heuristic. That ambiguity is
+     * exactly the defect a prior review caught. Do NOT delete this as "redundant with the two
+     * tests above" — the two tests above both happen to include (or consist entirely of) their
+     * own family's line, so neither one alone exercises the specific shape that was ambiguous:
+     * a seat/business line with NO corresponding base line. This test forces both cases through
+     * the SAME seat quantity (10) so the only variable is which lookup-key family is present,
+     * and asserts the tier values differ — if a future refactor reintroduces a
+     * `seats_included === 0` (or similarly seat-count-derived) heuristic for tier, this is the
+     * assertion that catches it; every other tier test in this file would still pass.
+     */
+    it('cloud_seat_monthly with NO cloud_base line is still tier "cloud" — and differs from a same-shaped Business subscription', async () => {
+      const sql = await hubTestSql()
+      await seedOrg(sql, 'org_cloud_seat_only')
+      await seedOrg(sql, 'org_business_only')
+
+      // Same seat quantity (10), same seats_included (0, since neither carries a base line),
+      // same seats_purchased (10) — the ONLY difference is which lookup-key family sold the seats.
+      await syncSubscriptionFromStripe(sql, subscription({
+        id: 'sub_cloud_seat_only', customer: 'cus_cloud_seat_only', metadata: { orgId: 'org_cloud_seat_only' },
+        items: { data: [item('cloud_seat_monthly', 10)] },
+      }))
+      await syncSubscriptionFromStripe(sql, subscription({
+        id: 'sub_business_only', customer: 'cus_business_only', metadata: { orgId: 'org_business_only' },
+        items: { data: [item('business_seat_monthly', 10)] },
+      }))
+
+      const cloudRow = (await sql.query(
+        'SELECT tier, seats_included, seats_purchased FROM subscriptions WHERE org_id = $1', ['org_cloud_seat_only'],
+      )).rows[0]
+      const businessRow = (await sql.query(
+        'SELECT tier, seats_included, seats_purchased FROM subscriptions WHERE org_id = $1', ['org_business_only'],
+      )).rows[0]
+
+      // Identical seat-column shape...
+      expect(cloudRow).toMatchObject({ seats_included: 0, seats_purchased: 10 })
+      expect(businessRow).toMatchObject({ seats_included: 0, seats_purchased: 10 })
+      // ...but tier correctly distinguishes them anyway.
+      expect(cloudRow.tier).toBe('cloud')
+      expect(businessRow.tier).toBe('business')
+      expect(cloudRow.tier).not.toBe(businessRow.tier)
+    })
+
     it('a subscription mixing Cloud and Business lookup keys resolves to "cloud" deterministically and logs loudly', async () => {
       const sql = await hubTestSql()
       await seedOrg(sql, 'org_a')
