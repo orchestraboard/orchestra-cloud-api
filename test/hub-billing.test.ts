@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, afterEach } from 'vitest'
 import type { FastifyInstance } from 'fastify'
-import { createCheckoutSession, createPortalSession, syncSubscriptionFromStripe, type StripeBillingClient, type StripeSubscriptionLike, type SyncLogger } from '../src/hub/billing.js'
+import { createCheckoutSession, createPortalSession, subscriptionSuspendsOrg, syncSubscriptionFromStripe, type StripeBillingClient, type StripeSubscriptionLike, type SyncLogger } from '../src/hub/billing.js'
 import { ValidationError } from '../src/hub/errors.js'
 import { assertOrgWritable } from '../src/hub/entitlements.js'
 import { buildHubServer } from '../src/hub/server.js'
@@ -639,23 +639,69 @@ describe('createCheckoutSession refuses a second subscription', () => {
     expect(stripe.checkout.sessions.create).not.toHaveBeenCalled()
   })
 
-  it('also refuses mid-dunning (past_due) — that subscription is still live and still billing', async () => {
-    const sql = await orgWithSubscription('past_due')
+  /**
+   * "Would a second checkout collide?" is a DIFFERENT question from "should this org be
+   * suspended?", and the first version of this guard wrongly asked the second one — which let
+   * an `unpaid` or `paused` org open a second subscription, re-opening the exact harm the
+   * guard exists to prevent. Collision is about whether a Stripe subscription object still
+   * exists and can resume; suspension is about whether money is currently flowing.
+   *
+   * `unpaid` and `paused` are the two statuses where those answers differ, so they are the
+   * regression this table is really for. `incomplete` blocks too: an abandoned SCA challenge
+   * can still be completed by the customer until Stripe expires it, and two live
+   * subscriptions is worse than a refusal that clears itself within ~23 hours.
+   */
+  for (const status of ['active', 'trialing', 'past_due', 'unpaid', 'paused', 'incomplete', 'some_future_stripe_status']) {
+    it(`refuses a second checkout while a subscription in status "${status}" still exists`, async () => {
+      const sql = await orgWithSubscription(status)
+      const stripe = mockStripe()
+
+      await expect(
+        createCheckoutSession(sql, stripe, { orgId: 'org_a', lookupKey: 'cloud_base_monthly', webOrigin: WEB_ORIGIN }),
+      ).rejects.toBeInstanceOf(ValidationError)
+      expect(stripe.checkout.sessions.create).not.toHaveBeenCalled()
+    })
+  }
+
+  /** Only the two terminal statuses release the guard — Stripe can revive neither, so there is
+   * nothing left for a new subscription to collide with. */
+  for (const status of ['canceled', 'incomplete_expired']) {
+    it(`allows checkout again after "${status}" — a returning customer can re-subscribe`, async () => {
+      const sql = await orgWithSubscription(status)
+      const stripe = mockStripe()
+
+      await expect(
+        createCheckoutSession(sql, stripe, { orgId: 'org_a', lookupKey: 'cloud_base_monthly', webOrigin: WEB_ORIGIN }),
+      ).resolves.toEqual({ url: 'https://checkout.stripe.com/session_abc' })
+    })
+  }
+
+  /** The two questions diverge, and each is answered by its own set. `unpaid` and `paused`
+   * suspend the org AND block a second checkout; `past_due` and `incomplete` do neither of the
+   * first but still block. Asserting both together is what would have caught the conflation. */
+  it('suspension and collision are answered independently for every status', async () => {
     const stripe = mockStripe()
+    const expected: Array<[string, boolean, boolean]> = [
+      // status, suspends the org, blocks a second checkout
+      ['active', false, true],
+      ['trialing', false, true],
+      ['past_due', false, true],
+      ['incomplete', false, true],
+      ['unpaid', true, true],
+      ['paused', true, true],
+      ['canceled', true, false],
+      ['incomplete_expired', true, false],
+    ]
 
-    await expect(
-      createCheckoutSession(sql, stripe, { orgId: 'org_a', lookupKey: 'cloud_base_monthly', webOrigin: WEB_ORIGIN }),
-    ).rejects.toBeInstanceOf(ValidationError)
-    expect(stripe.checkout.sessions.create).not.toHaveBeenCalled()
-  })
-
-  it('allows checkout again once the subscription is canceled — a returning customer can re-subscribe', async () => {
-    const sql = await orgWithSubscription('canceled')
-    const stripe = mockStripe()
-
-    await expect(
-      createCheckoutSession(sql, stripe, { orgId: 'org_a', lookupKey: 'cloud_base_monthly', webOrigin: WEB_ORIGIN }),
-    ).resolves.toEqual({ url: 'https://checkout.stripe.com/session_abc' })
+    for (const [status, suspends, blocks] of expected) {
+      expect(subscriptionSuspendsOrg(status), `${status} suspends`).toBe(suspends)
+      const sql = await orgWithSubscription(status)
+      const attempt = createCheckoutSession(sql, stripe, {
+        orgId: 'org_a', lookupKey: 'cloud_base_monthly', webOrigin: WEB_ORIGIN,
+      })
+      if (blocks) await expect(attempt, `${status} blocks checkout`).rejects.toBeInstanceOf(ValidationError)
+      else await expect(attempt, `${status} allows checkout`).resolves.toBeTruthy()
+    }
   })
 
   it('allows checkout for a row that has a cached customer but never completed a subscription', async () => {

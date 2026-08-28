@@ -308,6 +308,26 @@ export function subscriptionSuspendsOrg(status: string): boolean {
 }
 
 /**
+ * The statuses after which no Stripe subscription object remains that a new checkout could
+ * collide with — Stripe cannot revive either one, so the org is free to subscribe again.
+ *
+ * This is a DIFFERENT question from `subscriptionSuspendsOrg`, and the first version of this
+ * fix wrongly asked that one instead. "Should this org be suspended?" is true whenever no
+ * money is flowing, which includes `unpaid` and `paused` — but a subscription in either of
+ * those states still EXISTS and can resume (a retried invoice succeeding, a pause window
+ * ending), so a second checkout against it recreates exactly the double-billing and
+ * entitlement-destruction this guard exists to prevent. Suspension is about money; this is
+ * about object lifetime, and only `canceled` and `incomplete_expired` are terminal.
+ *
+ * `incomplete` is deliberately NOT here: an abandoned SCA challenge can still be completed by
+ * the customer until Stripe expires it (~23h), at which point it becomes `incomplete_expired`
+ * and this set lets the retry through. Refusing for that window is the money-safe side of the
+ * trade — the alternative is two live subscriptions if the customer finishes the first
+ * payment after starting a second checkout.
+ */
+const TERMINAL_SUBSCRIPTION_STATUS = new Set(['canceled', 'incomplete_expired'])
+
+/**
  * Refuses a checkout for an org that already has a live subscription, pointing the caller at
  * the billing portal instead.
  *
@@ -321,6 +341,9 @@ export function subscriptionSuspendsOrg(status: string): boolean {
  * `stripe_subscription_id IS NOT NULL` is part of the test on purpose: a `subscriptions` row
  * can exist with only a cached `stripe_customer_id` (schema default status `'inactive'`, no
  * subscription ever completed), and that org must still be able to check out.
+ *
+ * Reads `TERMINAL_SUBSCRIPTION_STATUS`, never `subscriptionSuspendsOrg` — see that constant's
+ * comment for why suspension is the wrong question here.
  */
 async function refuseSecondSubscription(sql: HubSqlPool, orgId: string): Promise<void> {
   const result = await sql.query<{ status: string; stripe_subscription_id: string | null }>(
@@ -328,12 +351,15 @@ async function refuseSecondSubscription(sql: HubSqlPool, orgId: string): Promise
   )
   const row = result.rows[0]
   if (!row?.stripe_subscription_id) return
-  if (subscriptionSuspendsOrg(row.status)) return
+  if (TERMINAL_SUBSCRIPTION_STATUS.has(row.status)) return
 
+  // Deliberately not worded "already has an ACTIVE subscription": this also refuses `unpaid`
+  // and `paused`, where the subscription exists and can resume but is not active.
   throw new ValidationError(
-    'this org already has an active subscription — use the billing portal to change your plan, '
-    + 'seats, or payment method. Starting a second checkout would create a second subscription '
-    + 'against the same customer and overwrite the entitlements you have already paid for.',
+    'this org already has a subscription — use the billing portal to change your plan, seats, '
+    + 'or payment method, or to cancel it before starting a new one. Starting a second checkout '
+    + 'would create a second subscription against the same customer and overwrite the '
+    + 'entitlements you have already paid for.',
   )
 }
 
