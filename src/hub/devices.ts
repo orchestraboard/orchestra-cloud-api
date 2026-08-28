@@ -3,7 +3,9 @@ import { ForbiddenError, NotFoundError } from './errors.js'
 import type { HubSql } from './sql.js'
 import { boundedString } from './validate.js'
 
-const TOKEN_PREFIX = 'orchestra_device_v1.'
+/** Exported so server.ts can discriminate device vs. Clerk tokens by shape alone, with no lookup. */
+export const DEVICE_TOKEN_PREFIX = 'orchestra_device_v1.'
+const TOKEN_PREFIX = DEVICE_TOKEN_PREFIX
 
 export interface HubDevice {
   id: string

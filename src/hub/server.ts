@@ -2,7 +2,8 @@ import Fastify, { type FastifyInstance, type FastifyRequest } from 'fastify'
 import { hubOpsPlugin } from './routes/ops.js'
 import { hubSyncPlugin } from './routes/sync.js'
 import { HubBroadcaster } from './broadcast.js'
-import { verifyDeviceToken, type HubDevice } from './devices.js'
+import { verifyDeviceToken, DEVICE_TOKEN_PREFIX, type HubDevice } from './devices.js'
+import { verifyClerkToken, resolveOrgForClerk } from './clerk.js'
 import { HubError } from './errors.js'
 import { registerHubCors } from './cors.js'
 import type { HubSqlPool } from './sql.js'
@@ -11,6 +12,8 @@ declare module 'fastify' {
   interface FastifyRequest {
     hubDevice: HubDevice | null
     hubOrgId: string | null
+    /** Set for a Clerk-authenticated browser request; null for a device token. */
+    hubUserId: string | null
   }
   interface FastifyInstance {
     /** Exposed for tests that need to assert on subscriber counts / leak-freedom. */
@@ -22,17 +25,28 @@ export interface HubServerOptions {
   presenceTtlSeconds?: number
   /** The single browser origin (Vercel-hosted web UI) allowed cross-origin access. See src/hub/cors.ts. */
   webOrigin?: string
+  /** From HubEnv#clerkSecretKey. Omitted (or unset) means Clerk JWTs are never accepted — only device tokens. */
+  clerkSecretKey?: string
 }
 
 /**
- * A single generic message for "token never existed" and "token was revoked".
+ * A single generic message for "token never existed" and "token was revoked" —
+ * and, since Task 3, for every way a Clerk JWT can fail to verify too.
  * `verifyDeviceToken` deliberately throws different `.message` strings for the
- * two cases so the domain layer and logs stay diagnosable, but if that
+ * device-token cases so the domain layer and logs stay diagnosable, but if that
  * distinction reached an HTTP client it would let an attacker probe which
  * tokens are real. Every failure to authenticate — bad format, unknown hash,
- * revoked — collapses to this one body.
+ * revoked, bad signature, expired — collapses to this one body, regardless of
+ * which token type it came from. See clerk.ts's CLERK_TOKEN_INVALID comment
+ * for why a *second* generic wording would reintroduce the same oracle this
+ * body exists to prevent.
  */
 const INVALID_TOKEN_BODY = { error: 'device token is not valid', code: 'forbidden' } as const
+
+/** Distinct from INVALID_TOKEN_BODY on purpose: this token verified fine (it's a genuine, signed
+ * Clerk session), so there's nothing to hide — the user just isn't in this org. Compare to the
+ * device-token path's existing "device is not a member of this org" 403, which is equally explicit. */
+const NOT_A_MEMBER_BODY = { error: 'user is not a member of this org', code: 'forbidden' } as const
 
 /**
  * The hub's own Fastify app. It deliberately does NOT reuse `buildServer()` from
@@ -52,6 +66,7 @@ export function buildHubServer(sql: HubSqlPool, opts: HubServerOptions = {}): Fa
   })
   server.decorateRequest('hubDevice', null)
   server.decorateRequest('hubOrgId', null)
+  server.decorateRequest('hubUserId', null)
 
   // Registered before the auth hook below: @fastify/cors answers preflight
   // OPTIONS requests from its own onRequest hook (registered in call order,
@@ -72,6 +87,14 @@ export function buildHubServer(sql: HubSqlPool, opts: HubServerOptions = {}): Fa
    * route-specific — see the "request.params is available in onRequest"
    * assertion in test/hub-server.test.ts, which exercises this directly rather
    * than trusting it.
+   *
+   * Since Task 3, the bearer token is either a device token (daemons) or a
+   * Clerk session JWT (signed-in browsers). The two are discriminated by
+   * SHAPE — the `orchestra_device_v1.` prefix — never by trial: a Clerk token
+   * never reaches `verifyDeviceToken` (that would cost a DB round trip on
+   * every browser request just to fail), and a device token never reaches
+   * `verifyClerkToken` (that would cost a Clerk network/JWKS round trip on
+   * every daemon request just to fail).
    */
   server.addHook('onRequest', async (request: FastifyRequest, reply) => {
     reply.header('cache-control', 'no-store')
@@ -85,23 +108,59 @@ export function buildHubServer(sql: HubSqlPool, opts: HubServerOptions = {}): Fa
       return reply.code(403).send({ error: 'device token is required', code: 'forbidden' })
     }
 
-    let device: HubDevice
+    const requestedOrg = (request.params as any)?.orgId
+
+    if (token.startsWith(DEVICE_TOKEN_PREFIX)) {
+      let device: HubDevice
+      try {
+        device = await verifyDeviceToken(sql, token)
+      } catch {
+        // Deliberately drop the caught error's own message/status — see
+        // INVALID_TOKEN_BODY above. Do not branch on `error instanceof HubError`
+        // here; that branch is exactly what would leak "unknown" vs "revoked".
+        return reply.code(403).send(INVALID_TOKEN_BODY)
+      }
+
+      if (typeof requestedOrg === 'string' && requestedOrg !== device.org_id) {
+        return reply.code(403).send({ error: 'device is not a member of this org', code: 'forbidden' })
+      }
+
+      request.hubDevice = device
+      request.hubOrgId = device.org_id
+      request.hubUserId = null
+      return
+    }
+
+    let principal: Awaited<ReturnType<typeof verifyClerkToken>>
     try {
-      device = await verifyDeviceToken(sql, token)
+      principal = await verifyClerkToken(token, { clerkSecretKey: opts.clerkSecretKey })
     } catch {
-      // Deliberately drop the caught error's own message/status — see
-      // INVALID_TOKEN_BODY above. Do not branch on `error instanceof HubError`
-      // here; that branch is exactly what would leak "unknown" vs "revoked".
+      // Same collapse as the device-token path above, and for the same reason:
+      // an attacker holding a dead Clerk token must not be able to tell "bad
+      // signature" apart from "expired" apart from "device token that also
+      // happens to be malformed" by response shape.
       return reply.code(403).send(INVALID_TOKEN_BODY)
     }
 
-    const requestedOrg = (request.params as any)?.orgId
-    if (typeof requestedOrg === 'string' && requestedOrg !== device.org_id) {
-      return reply.code(403).send({ error: 'device is not a member of this org', code: 'forbidden' })
+    let resolved: Awaited<ReturnType<typeof resolveOrgForClerk>>
+    try {
+      resolved = await resolveOrgForClerk(sql, principal)
+    } catch {
+      // Unlike the two catches above, this token verified fine — the user is
+      // a real, currently-authenticated person. There is no "unknown vs.
+      // revoked" ambiguity to protect by staying generic, so this can and
+      // does name the actual reason (mirrors the device path's own
+      // "not a member of this org" 403 a few lines up).
+      return reply.code(403).send(NOT_A_MEMBER_BODY)
     }
 
-    request.hubDevice = device
-    request.hubOrgId = device.org_id
+    if (typeof requestedOrg === 'string' && requestedOrg !== resolved.orgId) {
+      return reply.code(403).send(NOT_A_MEMBER_BODY)
+    }
+
+    request.hubDevice = null
+    request.hubOrgId = resolved.orgId
+    request.hubUserId = resolved.userId
   })
 
   server.setErrorHandler((error, _request, reply) => {
