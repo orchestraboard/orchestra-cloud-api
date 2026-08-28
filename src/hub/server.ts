@@ -1,3 +1,4 @@
+import Stripe from 'stripe'
 import Fastify, { type FastifyInstance, type FastifyRequest } from 'fastify'
 import { hubOpsPlugin } from './routes/ops.js'
 import { hubSyncPlugin } from './routes/sync.js'
@@ -5,7 +6,9 @@ import { HubBroadcaster } from './broadcast.js'
 import { verifyDeviceToken, DEVICE_TOKEN_PREFIX, type HubDevice } from './devices.js'
 import { verifyClerkToken, resolveOrgForClerk } from './clerk.js'
 import { hubClerkWebhookPlugin } from './webhooks/clerk.js'
-import { HubError } from './errors.js'
+import { hubStripeWebhookPlugin, type StripeWebhookClient } from './webhooks/stripe.js'
+import { createCheckoutSession, createPortalSession, type StripeBillingClient } from './billing.js'
+import { HubError, ValidationError } from './errors.js'
 import { registerHubCors } from './cors.js'
 import type { HubSqlPool } from './sql.js'
 
@@ -32,6 +35,21 @@ export interface HubServerOptions {
    * POST /webhooks/clerk — see src/hub/webhooks/clerk.ts. Omitted (or unset) means that
    * route always answers 500 rather than ever accepting an unsigned payload. */
   clerkWebhookSigningSecret?: string
+  /** From HubEnv#stripeSecretKey. Builds the one `Stripe` client this process uses for
+   * checkout/portal session creation and for fetching subscriptions the webhook needs.
+   * Omitted (or unset) means the billing routes and webhook always answer with "not
+   * configured" rather than ever running unauthenticated Stripe calls. Ignored if
+   * `stripeClient` is also given. */
+  stripeSecretKey?: string
+  /** From HubEnv#stripeWebhookSecret. Verifies Stripe's own webhook signature at
+   * POST /webhooks/stripe — see src/hub/webhooks/stripe.ts. Omitted (or unset) means that
+   * route always answers 500 rather than ever accepting an unsigned payload. */
+  stripeWebhookSecret?: string
+  /** Test-only injection point: overrides the Stripe client `buildHubServer` would otherwise
+   * construct from `stripeSecretKey`. Production never sets this — src/hub-cli.ts and
+   * src/hub-entry.ts only ever pass `stripeSecretKey`. Lets tests exercise checkout, portal,
+   * and the webhook against a mock rather than a real Stripe API call. */
+  stripeClient?: StripeBillingClient & StripeWebhookClient
 }
 
 /**
@@ -192,7 +210,70 @@ export function buildHubServer(sql: HubSqlPool, opts: HubServerOptions = {}): Fa
   // hook by design: it verifies Clerk's own Svix signature instead of a
   // bearer token. See src/hub/webhooks/clerk.ts.
   server.register(hubClerkWebhookPlugin, { sql, env: { clerkWebhookSigningSecret: opts.clerkWebhookSigningSecret } })
+
+  // `opts.stripeClient` (test injection) wins over building one from `stripeSecretKey` — see
+  // the doc comment on HubServerOptions#stripeClient. A real `Stripe` instance satisfies both
+  // `StripeBillingClient` and `StripeWebhookClient` structurally, so it needs no adaptation.
+  const stripe: (StripeBillingClient & StripeWebhookClient) | null =
+    opts.stripeClient ?? (opts.stripeSecretKey ? new Stripe(opts.stripeSecretKey) : null)
+
+  // Mounted OUTSIDE `/api/v1/hub/`, same reasoning as the Clerk webhook above: it carries its
+  // own Stripe signature instead of a bearer token. See src/hub/webhooks/stripe.ts. Registered
+  // even when `stripe` is null — the route itself still needs to exist to answer "not
+  // configured" rather than 404, matching the Clerk webhook's stance when its secret is unset.
+  server.register(hubStripeWebhookPlugin, {
+    sql,
+    env: { stripeWebhookSecret: opts.stripeWebhookSecret },
+    stripe: stripe ?? NOT_CONFIGURED_STRIPE_CLIENT,
+  })
+
+  // Authenticated (inside `/api/v1/hub/`, so the onRequest hook above resolves and scopes
+  // `request.hubOrgId` the same way every other org-scoped route does) thin wrappers around
+  // src/hub/billing.ts. Kept inline here rather than as their own routes/ file — this task's
+  // brief scopes its server.ts change to wiring, not a new plugin file.
+  server.post('/api/v1/hub/orgs/:orgId/billing/checkout', async (request, reply) => {
+    if (!stripe) return reply.code(500).send({ error: 'billing is not configured', code: 'internal_error' })
+    const orgId = requireHubOrgId(request)
+    const body = (request.body ?? {}) as Record<string, unknown>
+    const lookupKey = typeof body.lookup_key === 'string' ? body.lookup_key : ''
+    const quantity = typeof body.quantity === 'number' ? body.quantity : undefined
+    const result = await createCheckoutSession(sql, stripe, { orgId, lookupKey, quantity })
+    return reply.send(result)
+  })
+
+  server.post('/api/v1/hub/orgs/:orgId/billing/portal', async (request, reply) => {
+    if (!stripe) return reply.code(500).send({ error: 'billing is not configured', code: 'internal_error' })
+    const orgId = requireHubOrgId(request)
+    const result = await createPortalSession(sql, stripe, { orgId })
+    return reply.send(result)
+  })
+
   server.get('/healthz', async () => ({ ok: true, presence_ttl_seconds: opts.presenceTtlSeconds ?? 45 }))
 
   return server
+}
+
+function requireHubOrgId(request: FastifyRequest): string {
+  const orgId = request.hubOrgId
+  if (!orgId) throw new ValidationError('org scope was not resolved')
+  return orgId
+}
+
+/**
+ * Stands in for `stripe` in the webhook plugin registration when no Stripe client exists at
+ * all (`stripeSecretKey` unset and no `stripeClient` override) — the plugin's own `env.secret`
+ * check always answers 500 before either method here would ever run, so these throwing stubs
+ * exist only to satisfy the plugin's required `stripe` option, never to be called.
+ */
+const NOT_CONFIGURED_STRIPE_CLIENT: StripeWebhookClient = {
+  webhooks: {
+    constructEventAsync() {
+      throw new Error('stripe is not configured')
+    },
+  },
+  subscriptions: {
+    retrieve() {
+      throw new Error('stripe is not configured')
+    },
+  },
 }

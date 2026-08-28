@@ -32,6 +32,8 @@ async function main(): Promise<void> {
     webOrigin: env.webOrigin,
     clerkSecretKey: env.clerkSecretKey,
     clerkWebhookSigningSecret: env.clerkWebhookSigningSecret,
+    stripeSecretKey: env.stripeSecretKey,
+    stripeWebhookSecret: env.stripeWebhookSecret,
   })
   await server.listen({ host: '0.0.0.0', port: env.port })
   console.log(`orchestra hub listening on 0.0.0.0:${env.port}`)

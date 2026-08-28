@@ -77,7 +77,7 @@ describe('hub migrations', () => {
 
     // And a clean retry against a repaired runner applies it in full.
     const retry = await hubMigrate(db)
-    expect(retry).toEqual(['002-hub-work', '003-hub-events', '004-hub-event-seq'])
+    expect(retry).toEqual(['002-hub-work', '003-hub-events', '004-hub-event-seq', '005-hub-entitlements'])
   })
 
   it('holds an advisory lock for the whole run and releases it, even on failure', async () => {
@@ -106,8 +106,8 @@ describe('hub migrations', () => {
     expect(await hubMigrate(pool)).toContain('001-hub-core')
     expect(released).toBe(true)
     expect(onConnection.filter((text) => /pg_advisory_lock/.test(text))).toHaveLength(1)
-    expect(onConnection.filter((text) => text === 'BEGIN')).toHaveLength(4)
-    expect(onConnection.filter((text) => text === 'COMMIT')).toHaveLength(4)
+    expect(onConnection.filter((text) => text === 'BEGIN')).toHaveLength(5)
+    expect(onConnection.filter((text) => text === 'COMMIT')).toHaveLength(5)
   })
 })
 
