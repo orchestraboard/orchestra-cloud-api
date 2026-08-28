@@ -1,5 +1,7 @@
 import Fastify, { type FastifyInstance, type FastifyRequest } from 'fastify'
 import { hubOpsPlugin } from './routes/ops.js'
+import { hubSyncPlugin } from './routes/sync.js'
+import { HubBroadcaster } from './broadcast.js'
 import { verifyDeviceToken, type HubDevice } from './devices.js'
 import { HubError } from './errors.js'
 import type { HubSqlPool } from './sql.js'
@@ -8,6 +10,10 @@ declare module 'fastify' {
   interface FastifyRequest {
     hubDevice: HubDevice | null
     hubOrgId: string | null
+  }
+  interface FastifyInstance {
+    /** Exposed for tests that need to assert on subscriber counts / leak-freedom. */
+    hubBroadcast: HubBroadcaster
   }
 }
 
@@ -94,7 +100,10 @@ export function buildHubServer(sql: HubSqlPool, opts: HubServerOptions = {}): Fa
     return reply.code(500).send({ error: 'internal error', code: 'internal_error' })
   })
 
-  server.register(hubOpsPlugin, { sql, prefix: '/api/v1/hub' })
+  const broadcast = new HubBroadcaster()
+  server.decorate('hubBroadcast', broadcast)
+  server.register(hubOpsPlugin, { sql, broadcast, prefix: '/api/v1/hub' })
+  server.register(hubSyncPlugin, { sql, broadcast, prefix: '/api/v1/hub' })
   server.get('/healthz', async () => ({ ok: true, presence_ttl_seconds: opts.presenceTtlSeconds ?? 45 }))
 
   return server

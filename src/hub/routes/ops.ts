@@ -1,13 +1,15 @@
 import type { FastifyPluginAsync, FastifyPluginOptions, FastifyRequest } from 'fastify'
 import { claimCard, createCard, moveCard, updateCard } from '../cards.js'
-import { latestOrgSeq } from '../events.js'
+import { latestOrgSeq, readOrgEventsSince } from '../events.js'
 import { drainInbox, sendMail } from '../mail.js'
 import { heartbeat, listAgents, registerAgent } from '../presence.js'
 import { ValidationError } from '../errors.js'
+import type { HubBroadcaster } from '../broadcast.js'
 import type { HubSqlPool } from '../sql.js'
 
 export interface HubOpsRouteOptions extends FastifyPluginOptions {
   sql: HubSqlPool
+  broadcast: HubBroadcaster
 }
 
 /** Every op a daemon can issue. Anything not listed here is a 400, not a 404. */
@@ -24,7 +26,7 @@ const OPS = new Set([
  * that decides what a client is allowed to see.
  */
 export const hubOpsPlugin: FastifyPluginAsync<HubOpsRouteOptions> = async (app, options) => {
-  const { sql } = options
+  const { sql, broadcast } = options
 
   app.post('/orgs/:orgId/ops', async (request: FastifyRequest, reply) => {
     const orgId = requireOrg(request)
@@ -37,8 +39,16 @@ export const hubOpsPlugin: FastifyPluginAsync<HubOpsRouteOptions> = async (app, 
     const actorDeviceId = request.hubDevice?.id ?? null
     const common = { orgId, actorDeviceId, idempotencyKey }
 
+    const before = await latestOrgSeq(sql, orgId)
     const result = await runOp(op, payload, common, sql)
-    return reply.send({ result, seq: await latestOrgSeq(sql, orgId) })
+    const after = await latestOrgSeq(sql, orgId)
+
+    // Publish whatever the op actually appended. A replayed idempotency key appends
+    // nothing (`before === after`), so this is a no-op for replays — live subscribers
+    // never see a second event for a call that didn't newly happen.
+    for (const event of await readOrgEventsSince(sql, orgId, before)) broadcast.publish(event)
+
+    return reply.send({ result, seq: after })
   })
 
   app.get('/orgs/:orgId/cards', async (request, reply) => {

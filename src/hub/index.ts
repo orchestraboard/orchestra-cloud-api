@@ -8,3 +8,4 @@ export { createCard, updateCard, moveCard, claimCard, getCard } from './cards.js
 export { sendMail, drainInbox } from './mail.js'
 export { registerAgent, heartbeat, sweepStalePresence, listAgents } from './presence.js'
 export { appendOrgEvent, readOrgEventsSince, latestOrgSeq } from './events.js'
+export { HubBroadcaster } from './broadcast.js'

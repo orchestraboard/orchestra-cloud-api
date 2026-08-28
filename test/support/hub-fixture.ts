@@ -3,6 +3,7 @@ import { buildHubServer } from '../../src/hub/server.js'
 import { mintDeviceToken } from '../../src/hub/devices.js'
 import { hubTestSql, seedOrg, seedBoard } from './hub-sql.js'
 import type { HubSqlPool } from '../../src/hub/sql.js'
+import type { HubBroadcaster } from '../../src/hub/broadcast.js'
 
 export interface HubFixture {
   sql: HubSqlPool
@@ -11,6 +12,8 @@ export interface HubFixture {
   boardId: string
   token: string
   auth: (token?: string) => Record<string, string>
+  /** The broadcaster wired into `server` — for asserting subscribe/unsubscribe behavior. */
+  broadcast: HubBroadcaster
 }
 
 const servers: FastifyInstance[] = []
@@ -29,6 +32,7 @@ export async function hubFixture(): Promise<HubFixture> {
   return {
     sql, server, orgId: 'org_a', boardId: 'board_1', token,
     auth: (override?: string) => ({ authorization: `Bearer ${override ?? token}` }),
+    broadcast: server.hubBroadcast,
   }
 }
 
