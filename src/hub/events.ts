@@ -13,8 +13,12 @@ export interface AppendOrgEvent {
 }
 
 /**
- * Appends one event and allocates the org's next `seq` in the same statement.
- * The SELECT runs inside the INSERT so two writers cannot read the same max.
+ * Appends one event and allocates the org's next `seq` from `org_event_seq`.
+ * The idempotency replay check runs first and short-circuits before any
+ * allocation, so a replayed key never burns a seq number. Allocation itself is
+ * a single `INSERT ... ON CONFLICT DO UPDATE ... RETURNING`, which takes a row
+ * lock on the counter row and so serialises correctly against concurrent
+ * callers — whether `appendOrgEvent` is called bare or inside `withTransaction`.
  * Callers that also mutate an entity MUST wrap both in one `withTransaction`.
  */
 export async function appendOrgEvent(sql: HubSql, input: AppendOrgEvent): Promise<HubEvent> {
@@ -32,14 +36,20 @@ export async function appendOrgEvent(sql: HubSql, input: AppendOrgEvent): Promis
     }
   }
 
+  const allocated = await sql.query<{ next_seq: string | number }>(
+    `INSERT INTO org_event_seq (org_id, next_seq) VALUES ($1, 1)
+     ON CONFLICT (org_id) DO UPDATE SET next_seq = org_event_seq.next_seq + 1
+     RETURNING next_seq`,
+    [input.orgId],
+  )
+  const seq = Number(allocated.rows[0]?.next_seq)
+
   const inserted = await sql.query<HubEvent>(
     `INSERT INTO org_events (id, org_id, seq, kind, board_id, actor_device_id, idempotency_key, payload)
-     VALUES ($1, $2,
-             (SELECT COALESCE(MAX(seq), 0) + 1 FROM org_events WHERE org_id = $2),
-             $3, $4, $5, $6, $7)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
      RETURNING *`,
     [
-      `evt_${randomUUID()}`, input.orgId, input.kind,
+      `evt_${randomUUID()}`, input.orgId, seq, input.kind,
       input.boardId ?? null, input.actorDeviceId ?? null, key,
       JSON.stringify(input.payload ?? {}),
     ],

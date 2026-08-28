@@ -10,6 +10,7 @@ export const HUB_MIGRATIONS: readonly { id: string; sqlFile: string }[] = [
   { id: '001-hub-core', sqlFile: '001-hub-core.sql' },
   { id: '002-hub-work', sqlFile: '002-hub-work.sql' },
   { id: '003-hub-events', sqlFile: '003-hub-events.sql' },
+  { id: '004-hub-event-seq', sqlFile: '004-hub-event-seq.sql' },
 ]
 
 async function migrationSql(sqlFile: string): Promise<string> {
