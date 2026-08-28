@@ -76,13 +76,36 @@ export interface CreateCheckoutSessionParams {
   /** Defaults to 1. Multiplies the resolved price's quantity — it can never change which price
    * or what it costs per unit. */
   quantity?: number
-  successUrl?: string
-  cancelUrl?: string
+  /** The web app's origin (e.g. `https://app.example.com` — scheme + host, no trailing slash),
+   * used to build `success_url`/`cancel_url`. Typed optional because callers thread it straight
+   * through from `HubServerOptions#webOrigin` (itself optional), but `createCheckoutSession`
+   * requires it at runtime — see `requireWebOrigin` below. */
+  webOrigin?: string
 }
 
 export interface CreatePortalSessionParams {
   orgId: string
-  returnUrl?: string
+  /** Same contract as `CreateCheckoutSessionParams#webOrigin` — builds `return_url`. */
+  webOrigin?: string
+}
+
+/**
+ * `webOrigin` is the same value CORS is scoped to (`src/hub/cors.ts`, from `WEB_ORIGIN` via
+ * `HubEnv`/`HubServerOptions`) — the browser's real, already-verified origin, not a guess.
+ * Throws a plain `Error` (not `ValidationError`): a missing `WEB_ORIGIN` is an ops/config
+ * problem, not a bad request from whoever clicked the button — same stance as "stripe catalogue
+ * is missing a price" below. This fails loudly and immediately, before any Stripe call: a
+ * hardcoded fallback domain would still create a real, live-mode-capable Checkout/Portal session
+ * and only surface as a broken redirect after the customer had already paid — silent then, not
+ * loud now. Refusing outright is the fix.
+ */
+function requireWebOrigin(webOrigin: string | undefined): string {
+  if (!webOrigin) {
+    throw new Error(
+      'WEB_ORIGIN must be configured to build checkout/portal redirect URLs — refusing to guess one',
+    )
+  }
+  return webOrigin
 }
 
 /** `'none'` means the subscription's items contained no lookup key this hub recognizes yet —
@@ -119,6 +142,7 @@ export async function createCheckoutSession(
     throw new ValidationError(`unknown price lookup key: ${params.lookupKey || '(missing)'}`)
   }
   const quantity = normalizeQuantity(params.quantity)
+  const webOrigin = requireWebOrigin(params.webOrigin)
 
   const prices = await stripe.prices.list({ lookup_keys: [params.lookupKey], expand: ['data.product'] })
   const price = prices.data[0]
@@ -139,8 +163,8 @@ export async function createCheckoutSession(
     metadata: { orgId: params.orgId },
     subscription_data: { metadata: { orgId: params.orgId } },
     ...(existingCustomerId ? { customer: existingCustomerId } : {}),
-    success_url: params.successUrl ?? 'https://app.orchestraboard.dev/billing?checkout=success',
-    cancel_url: params.cancelUrl ?? 'https://app.orchestraboard.dev/billing?checkout=cancelled',
+    success_url: `${webOrigin}/billing?checkout=success`,
+    cancel_url: `${webOrigin}/billing?checkout=cancelled`,
   })
 
   if (!session.url) throw new Error('stripe did not return a checkout session url')
@@ -162,10 +186,11 @@ export async function createPortalSession(
   if (!customerId) {
     throw new ValidationError('org has no Stripe customer yet; complete checkout before opening the billing portal')
   }
+  const webOrigin = requireWebOrigin(params.webOrigin)
 
   const session = await stripe.billingPortal.sessions.create({
     customer: customerId,
-    return_url: params.returnUrl ?? 'https://app.orchestraboard.dev/billing',
+    return_url: `${webOrigin}/billing`,
   })
 
   if (!session.url) throw new Error('stripe did not return a billing portal session url')

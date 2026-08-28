@@ -43,7 +43,7 @@ Provision in this order — each step's output feeds the next one's environment 
    manual migration step. Plain tables/indexes only, no Postgres extensions required.
 
 2. **Clerk application.** Development instance (see
-   [What this plan does NOT do](#not-in-scope) — a production Clerk instance is a deliberate
+   [What this plan does NOT do](#what-this-plan-does-not-do) — a production Clerk instance is a deliberate
    follow-up, not an oversight). Enable **Organizations**. Note the publishable key and secret
    key. Do not configure webhooks yet — the hub's public URL doesn't exist until step 4.
 
@@ -70,17 +70,20 @@ Provision in this order — each step's output feeds the next one's environment 
 5. **Vercel project.** Deploy `web/` using the root `vercel.json` (see
    [Vercel config](#vercel-config)). Set the two build-time env vars. Once it has a public URL,
    go back to Railway and set `WEB_ORIGIN` to that exact URL (protocol + host, no trailing
-   slash — see [CORS is exact-match](#cors-is-exact-match) below), then redeploy Railway so CORS
-   picks it up.
+   slash — see the `WEB_ORIGIN` row in [Environment variables](#environment-variables) below),
+   then redeploy Railway so CORS picks it up.
 
 6. **Webhooks**, now that the Railway URL is stable — see
    [Webhook endpoints](#webhook-endpoints).
 
-7. **Cross-check the redirect domain** — see
-   [Known limitation: hardcoded checkout/portal redirect domain](#known-limitation-hardcoded-checkoutportal-redirect-domain)
-   before declaring this done. It is easy to miss because nothing fails loudly.
+7. [Smoke test](#step-8-smoke-test-unexecuted).
 
-8. [Smoke test](#step-8-smoke-test-unexecuted).
+Checkout/portal redirect URLs are built from `WEB_ORIGIN` (`src/hub/billing.ts`) — there is no
+separate domain to configure or cross-check. If `WEB_ORIGIN` is unset when a checkout/portal
+session is requested, the hub refuses to create it (a 500, logged server-side with the exact
+missing-variable message) rather than guessing a domain — see
+[`WEB_ORIGIN` drives checkout/portal redirects](#web_origin-drives-checkoutportal-redirects)
+below.
 
 ### Why the session pooler, specifically
 
@@ -106,12 +109,12 @@ pooler mode before anything else.
 |---|---|---|---|
 | `HUB_DATABASE_URL` | Railway | yes | Supabase **session pooler** URI. `DATABASE_URL` also works as a fallback name (`src/hub/env.ts`) but prefer the explicit `HUB_` name to avoid colliding with a platform-injected `DATABASE_URL`. |
 | `PORT` | Railway | no | Railway injects this automatically; the hub binds `0.0.0.0:$PORT` (`src/hub-entry.ts`). Defaults to 4760 if unset. Don't set it by hand on Railway. |
-| `WEB_ORIGIN` | Railway | yes (for the browser to work at all) | The exact Vercel origin, e.g. `https://orchestra-web.vercel.app` — scheme + host, **no trailing slash, no path**. CORS is an exact string match (`src/hub/cors.ts`); anything else and the browser silently loses all cross-origin requests. |
+| `WEB_ORIGIN` | Railway | yes | The exact Vercel origin, e.g. `https://orchestra-web.vercel.app` — scheme + host, **no trailing slash, no path**. Does double duty: CORS is an exact string match against it (`src/hub/cors.ts`, so a wrong value silently loses all cross-origin requests), and it is also what `src/hub/billing.ts` builds Stripe checkout/portal redirect URLs from — see [`WEB_ORIGIN` drives checkout/portal redirects](#web_origin-drives-checkoutportal-redirects). With it unset, checkout/portal session creation refuses outright rather than guessing a domain. |
 | `HUB_BASE_URL` | Railway | no | Read into `HubEnv` (`src/hub/env.ts`) but **not currently consumed anywhere** in `src/hub-entry.ts` or `src/hub/server.ts` — nothing breaks if it's unset. Setting it to the Railway public URL anyway costs nothing and documents intent for whoever reads the Railway dashboard next. |
 | `CLERK_SECRET_KEY` | Railway | yes (to accept browser/API auth) | Server-side Clerk secret key. Verifies session JWTs (`src/hub/clerk.ts`) and signs the hub's own Clerk Backend API calls. |
 | `CLERK_PUBLISHABLE_KEY` | Railway | no | Read into `HubEnv` but **not used anywhere in the hub server** — the hub never needs it (it verifies tokens with the secret key only). Safe to omit on Railway; the browser needs its own copy, see `VITE_CLERK_PUBLISHABLE_KEY` below. |
 | `CLERK_WEBHOOK_SIGNING_SECRET` | Railway | yes (to accept the Clerk webhook) | From the Clerk webhook endpoint's signing secret (step 6). Without it, `POST /webhooks/clerk` always answers 500 rather than accept an unsigned payload — Clerk retries until it's set. |
-| `STRIPE_SECRET_KEY` | Railway | yes (for billing) | Test-mode secret key while `not in scope` production Clerk/Stripe live mode is deferred (see [What this plan does NOT do](#not-in-scope)). |
+| `STRIPE_SECRET_KEY` | Railway | yes (for billing) | Test-mode secret key while `not in scope` production Clerk/Stripe live mode is deferred (see [What this plan does NOT do](#what-this-plan-does-not-do)). |
 | `STRIPE_WEBHOOK_SECRET` | Railway | yes (to accept the Stripe webhook) | From the Stripe webhook endpoint's signing secret (step 6). Same fail-closed behavior as the Clerk webhook secret. |
 | `VITE_HUB_BASE_URL` | Vercel (**build-time**) | yes | The Railway hub's public URL. Baked into the JS bundle at build time by Vite — see [Vite env vars are build-time, not runtime](#vite-env-vars-are-build-time-not-runtime). |
 | `VITE_CLERK_PUBLISHABLE_KEY` | Vercel (**build-time**) | yes | Clerk's publishable key, browser-safe by design. Also build-time — same caveat. |
@@ -198,33 +201,36 @@ instead of the hub's bearer-token auth — they're mounted outside `/api/v1/hub/
 the `onRequest` auth hook never applies to them. Both fail closed with a 500 (not a silent 200) if
 their signing secret env var isn't set, so Clerk/Stripe keep retrying instead of giving up.
 
-## Known limitation: hardcoded checkout/portal redirect domain
+## `WEB_ORIGIN` drives checkout/portal redirects
 
-`src/hub/billing.ts`'s `createCheckoutSession` and `createPortalSession` fall back to a
-**hardcoded** `success_url`/`cancel_url`/`return_url` of `https://app.orchestraboard.dev/...`
-when the caller doesn't supply one — and `src/hub/server.ts`'s route handlers for both
-(`POST /orgs/:orgId/billing/checkout` and the portal equivalent) don't supply one, so that
-hardcoded default is what real checkout/portal sessions actually use today. This file's
-`deriveQuantities` function is reviewed/frozen for this task, and this URL default lives outside
-that function, but it is still existing, already-shipped behavior this task did not introduce
-and was not asked to change.
+`src/hub/billing.ts`'s `createCheckoutSession` and `createPortalSession` build
+`success_url`/`cancel_url` (checkout) and `return_url` (portal) from `WEB_ORIGIN` —
+`${webOrigin}/billing?checkout=success`, `${webOrigin}/billing?checkout=cancelled`, and
+`${webOrigin}/billing` respectively — the same origin `CORS` is already scoped to
+(`src/hub/cors.ts`), threaded through from `HubServerOptions#webOrigin` in
+`src/hub/server.ts`'s checkout/portal route handlers.
 
-**Practical effect:** unless the Vercel deployment's origin is exactly `app.orchestraboard.dev`,
-a customer completing Stripe Checkout (or leaving the billing portal) gets redirected to a domain
-that doesn't resolve to this deployment. The subscription itself still activates correctly —
-that's driven by the Stripe **webhook**, completely independent of whether the browser redirect
-succeeds — but the customer's browser dead-ends instead of landing back on the board.
+This was **not** the original behavior: earlier, both functions fell back to a hardcoded
+`https://app.orchestraboard.dev/...` whenever no explicit override URL was supplied, and nothing
+ever supplied one — so every real checkout/portal session silently redirected there regardless of
+where the app was actually deployed, redirecting a customer who had just paid to a domain that
+might not resolve to this deployment at all. Fixed as a correctness bug, not documented as a
+deployment footnote: a broken post-payment redirect is exactly the kind of thing that turns into a
+support ticket at the worst possible moment, even though the subscription itself always activated
+correctly — that part is driven by the Stripe **webhook**, entirely independent of whether the
+browser's redirect lands anywhere sensible.
 
-Two ways to close this, neither implemented here (out of scope for a deploy-config task, and
-`billing.ts` route handlers weren't cleared for edits in this task's brief):
-
-- **Recommended:** add a Vercel custom domain matching `app.orchestraboard.dev` (Project Settings
-  → Domains) so the hardcoded default resolves correctly. This does not conflict with
-  ["no custom domains" in What this plan does NOT do](#not-in-scope) — that item is about the
-  **hub's** own domain (Railway), not the web app's.
-- Or: accept the limitation for this deployment and have `server.ts`'s checkout/portal handlers
-  pass `successUrl`/`cancelUrl`/`returnUrl` built from `WEB_ORIGIN` in a follow-up task — this
-  would touch reviewed billing route code, so treat it as a separate, reviewed change.
+**If `WEB_ORIGIN` is not configured**, `createCheckoutSession`/`createPortalSession` throw
+immediately — before ever calling Stripe — rather than falling back to a guessed domain. The
+route handlers don't catch this specially; it flows to the hub's generic error handler as a 500
+with body `{"error": "internal error", "code": "internal_error"}`, while the real, specific
+message ("WEB_ORIGIN must be configured to build checkout/portal redirect URLs — refusing to
+guess one") is logged server-side (`server.log.error`) and never reaches the client — same
+convention the rest of the hub uses for ops/config problems (compare: "stripe catalogue is
+missing a price" in the same file). This is a deliberate loud failure: if `WEB_ORIGIN` is missing,
+every checkout/portal click fails immediately and visibly in Railway's logs, instead of quietly
+sending paying customers to a broken page. See `test/hub-billing.test.ts` for the tests covering
+both the URL-construction and the refuse-when-unset behavior.
 
 ## Local single-machine mode is unaffected
 
@@ -261,10 +267,10 @@ rest.
    with no plan yet — tier `'none'` — always goes through the Cloud checkout path; see the
    `BillingPage.tsx` tier-aware fix in this task's report). Complete checkout with Stripe's test
    card `4242 4242 4242 4242`, any future expiry, any CVC.
-   *Expected:* Redirect lands on the hardcoded `app.orchestraboard.dev` URL (see
-   [Known limitation](#known-limitation-hardcoded-checkoutportal-redirect-domain) — this is
-   expected to 404/dead-end unless that domain is configured). Regardless of where the browser
-   lands, check Railway logs for `POST /webhooks/stripe` (`checkout.session.completed`)
+   *Expected:* Redirect lands back on the Vercel app's own billing page
+   (`${WEB_ORIGIN}/billing?checkout=success` — see
+   [`WEB_ORIGIN` drives checkout/portal redirects](#web_origin-drives-checkoutportal-redirects)).
+   Also check Railway logs for `POST /webhooks/stripe` (`checkout.session.completed`)
    returning `200`, and confirm Supabase's `subscriptions` table now has a row for this org with
    `tier = 'cloud'` and `status = 'active'`.
 
@@ -316,8 +322,6 @@ exact response body/log line, not a paraphrase.
 
 ## What this plan does NOT do
 
-Production Clerk instance (development keys are deliberate for now), custom domains **for the
-hub** (Railway), per-seat proration edge cases, SSO enforcement beyond the entitlement flag, and
-multi-region/HA. All are follow-ups. (The Vercel custom-domain recommendation above, for the
-checkout-redirect limitation, is about the web app's domain, not the hub's — it doesn't
-contradict this.)
+Production Clerk instance (development keys are deliberate for now), custom domains, per-seat
+proration edge cases, SSO enforcement beyond the entitlement flag, and multi-region/HA. All are
+follow-ups.

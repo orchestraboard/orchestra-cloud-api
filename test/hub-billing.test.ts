@@ -6,6 +6,11 @@ import { buildHubServer } from '../src/hub/server.js'
 import { mintDeviceToken } from '../src/hub/devices.js'
 import { hubTestSql, seedOrg } from './support/hub-sql.js'
 
+/** A stand-in `WEB_ORIGIN` value — real tests of `webOrigin`'s absence live in their own
+ * dedicated cases below; every other test just needs *some* configured origin to get past
+ * `requireWebOrigin` and reach the behavior it's actually testing. */
+const WEB_ORIGIN = 'https://app.example.test'
+
 /** A `StripeBillingClient` mock — every method a `vi.fn()`, so a test can both control what
  * Stripe "returns" and assert exactly what this hub sent it. Never a real Stripe client: per
  * the task's constraint, nothing in this file makes a real Stripe API call. */
@@ -28,7 +33,7 @@ describe('createCheckoutSession', () => {
     await seedOrg(sql, 'org_a')
     const stripe = mockStripe()
 
-    await createCheckoutSession(sql, stripe, { orgId: 'org_a', lookupKey: 'cloud_base_monthly' })
+    await createCheckoutSession(sql, stripe, { orgId: 'org_a', lookupKey: 'cloud_base_monthly', webOrigin: WEB_ORIGIN })
 
     // The Stripe call names cloud_base_monthly via `lookup_keys` — never a `price_...` id, which
     // is exactly what makes this code mode-agnostic between Stripe test and live mode.
@@ -40,7 +45,7 @@ describe('createCheckoutSession', () => {
     await seedOrg(sql, 'org_a')
     const stripe = mockStripe({ priceId: 'price_cloud_base_xyz' })
 
-    await createCheckoutSession(sql, stripe, { orgId: 'org_a', lookupKey: 'cloud_base_monthly', quantity: 2 })
+    await createCheckoutSession(sql, stripe, { orgId: 'org_a', lookupKey: 'cloud_base_monthly', quantity: 2, webOrigin: WEB_ORIGIN })
 
     expect(stripe.checkout.sessions.create).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -82,6 +87,7 @@ describe('createCheckoutSession', () => {
     const smuggled = {
       orgId: 'org_a',
       lookupKey: 'cloud_base_monthly',
+      webOrigin: WEB_ORIGIN,
       price: 'price_evil_free_forever',
       amount: 1,
       unit_amount: 1,
@@ -119,7 +125,7 @@ describe('createCheckoutSession', () => {
     await seedOrg(sql, 'org_a')
     const stripe = mockStripe()
 
-    await createCheckoutSession(sql, stripe, { orgId: 'org_a', lookupKey: 'cloud_sso_monthly' })
+    await createCheckoutSession(sql, stripe, { orgId: 'org_a', lookupKey: 'cloud_sso_monthly', webOrigin: WEB_ORIGIN })
 
     expect(stripe.checkout.sessions.create).toHaveBeenCalledWith(
       expect.objectContaining({ line_items: [{ price: 'price_resolved_123', quantity: 1 }] }),
@@ -135,7 +141,7 @@ describe('createCheckoutSession', () => {
     )
     const stripe = mockStripe()
 
-    await createCheckoutSession(sql, stripe, { orgId: 'org_a', lookupKey: 'cloud_seat_monthly' })
+    await createCheckoutSession(sql, stripe, { orgId: 'org_a', lookupKey: 'cloud_seat_monthly', webOrigin: WEB_ORIGIN })
 
     expect(stripe.checkout.sessions.create).toHaveBeenCalledWith(expect.objectContaining({ customer: 'cus_existing_123' }))
   })
@@ -145,7 +151,7 @@ describe('createCheckoutSession', () => {
     await seedOrg(sql, 'org_a')
     const stripe = mockStripe()
 
-    await createCheckoutSession(sql, stripe, { orgId: 'org_a', lookupKey: 'cloud_seat_monthly' })
+    await createCheckoutSession(sql, stripe, { orgId: 'org_a', lookupKey: 'cloud_seat_monthly', webOrigin: WEB_ORIGIN })
 
     const call = stripe.checkout.sessions.create.mock.calls[0][0]
     expect(call.customer).toBeUndefined()
@@ -158,8 +164,36 @@ describe('createCheckoutSession', () => {
     stripe.prices.list.mockResolvedValue({ data: [] })
 
     await expect(
-      createCheckoutSession(sql, stripe, { orgId: 'org_a', lookupKey: 'business_seat_yearly' }),
+      createCheckoutSession(sql, stripe, { orgId: 'org_a', lookupKey: 'business_seat_yearly', webOrigin: WEB_ORIGIN }),
     ).rejects.not.toBeInstanceOf(ValidationError)
+  })
+
+  it('builds success_url/cancel_url from the configured webOrigin, not a hardcoded domain', async () => {
+    const sql = await hubTestSql()
+    await seedOrg(sql, 'org_a')
+    const stripe = mockStripe()
+
+    await createCheckoutSession(sql, stripe, { orgId: 'org_a', lookupKey: 'cloud_base_monthly', webOrigin: WEB_ORIGIN })
+
+    expect(stripe.checkout.sessions.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        success_url: `${WEB_ORIGIN}/billing?checkout=success`,
+        cancel_url: `${WEB_ORIGIN}/billing?checkout=cancelled`,
+      }),
+    )
+  })
+
+  it('refuses to create a checkout session when webOrigin is not configured, and never calls Stripe', async () => {
+    const sql = await hubTestSql()
+    await seedOrg(sql, 'org_a')
+    const stripe = mockStripe()
+
+    await expect(
+      createCheckoutSession(sql, stripe, { orgId: 'org_a', lookupKey: 'cloud_base_monthly' }),
+    ).rejects.toThrow(/WEB_ORIGIN/)
+
+    expect(stripe.prices.list).not.toHaveBeenCalled()
+    expect(stripe.checkout.sessions.create).not.toHaveBeenCalled()
   })
 })
 
@@ -182,10 +216,42 @@ describe('createPortalSession', () => {
     )
     const stripe = mockStripe()
 
-    const result = await createPortalSession(sql, stripe, { orgId: 'org_a' })
+    const result = await createPortalSession(sql, stripe, { orgId: 'org_a', webOrigin: WEB_ORIGIN })
 
     expect(stripe.billingPortal.sessions.create).toHaveBeenCalledWith(expect.objectContaining({ customer: 'cus_portal_456' }))
     expect(result.url).toBe('https://billing.stripe.com/portal_abc')
+  })
+
+  it('builds return_url from the configured webOrigin, not a hardcoded domain', async () => {
+    const sql = await hubTestSql()
+    await seedOrg(sql, 'org_a')
+    await sql.query(
+      `INSERT INTO subscriptions (org_id, stripe_customer_id, status) VALUES ($1, $2, 'active')`,
+      ['org_a', 'cus_portal_origin'],
+    )
+    const stripe = mockStripe()
+
+    await createPortalSession(sql, stripe, { orgId: 'org_a', webOrigin: WEB_ORIGIN })
+
+    expect(stripe.billingPortal.sessions.create).toHaveBeenCalledWith(
+      expect.objectContaining({ return_url: `${WEB_ORIGIN}/billing` }),
+    )
+  })
+
+  it('refuses to open a portal session when webOrigin is not configured, and never calls Stripe', async () => {
+    const sql = await hubTestSql()
+    await seedOrg(sql, 'org_a')
+    await sql.query(
+      `INSERT INTO subscriptions (org_id, stripe_customer_id, status) VALUES ($1, $2, 'active')`,
+      ['org_a', 'cus_portal_no_origin'],
+    )
+    const stripe = mockStripe()
+
+    await expect(
+      createPortalSession(sql, stripe, { orgId: 'org_a' }),
+    ).rejects.toThrow(/WEB_ORIGIN/)
+
+    expect(stripe.billingPortal.sessions.create).not.toHaveBeenCalled()
   })
 })
 
@@ -519,8 +585,18 @@ describe('billing HTTP routes', () => {
     for (const server of servers.splice(0)) await server.close()
   })
 
-  async function buildServer(sql: Awaited<ReturnType<typeof hubTestSql>>, stripe: ReturnType<typeof mockStripe> | undefined) {
-    const server = buildHubServer(sql as any, stripe ? { stripeClient: stripe } : {})
+  /** `webOrigin` defaults to the test constant so every existing happy-path test gets past
+   * `requireWebOrigin` without needing to know it exists — pass `null` explicitly to exercise
+   * the "WEB_ORIGIN not configured" failure mode instead. `null`, not `undefined`: a JS default
+   * parameter substitutes its default for an `undefined` argument regardless of whether that
+   * `undefined` was explicit or just omitted, so `undefined` can't distinguish "unset on
+   * purpose" from "didn't say" — `null` can. */
+  async function buildServer(
+    sql: Awaited<ReturnType<typeof hubTestSql>>,
+    stripe: ReturnType<typeof mockStripe> | undefined,
+    webOrigin: string | null = WEB_ORIGIN,
+  ) {
+    const server = buildHubServer(sql as any, { ...(stripe ? { stripeClient: stripe } : {}), webOrigin: webOrigin ?? undefined })
     servers.push(server)
     await server.ready()
     return server
@@ -623,5 +699,31 @@ describe('billing HTTP routes', () => {
     expect(checkoutResponse.json()).toMatchObject({ code: 'internal_error' })
     expect(portalResponse.statusCode).toBe(500)
     expect(portalResponse.json()).toMatchObject({ code: 'internal_error' })
+  })
+
+  it('checkout and portal both fail closed (500) when WEB_ORIGIN is not configured, and never reach Stripe', async () => {
+    const sql = await hubTestSql()
+    await seedOrg(sql, 'org_a')
+    await sql.query(`INSERT INTO subscriptions (org_id, stripe_customer_id, status) VALUES ($1, $2, 'active')`, ['org_a', 'cus_no_web_origin'])
+    const { token } = await mintDeviceToken(sql, { orgId: 'org_a', name: 'laptop' })
+    const stripe = mockStripe()
+    const server = await buildServer(sql, stripe, null)
+
+    const checkoutResponse = await server.inject({
+      method: 'POST', url: '/api/v1/hub/orgs/org_a/billing/checkout',
+      headers: { authorization: `Bearer ${token}` },
+      payload: { lookup_key: 'cloud_base_monthly' },
+    })
+    const portalResponse = await server.inject({
+      method: 'POST', url: '/api/v1/hub/orgs/org_a/billing/portal',
+      headers: { authorization: `Bearer ${token}` },
+    })
+
+    expect(checkoutResponse.statusCode).toBe(500)
+    expect(checkoutResponse.json()).toMatchObject({ code: 'internal_error' })
+    expect(portalResponse.statusCode).toBe(500)
+    expect(portalResponse.json()).toMatchObject({ code: 'internal_error' })
+    expect(stripe.checkout.sessions.create).not.toHaveBeenCalled()
+    expect(stripe.billingPortal.sessions.create).not.toHaveBeenCalled()
   })
 })

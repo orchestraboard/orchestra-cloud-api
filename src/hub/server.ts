@@ -239,14 +239,14 @@ export function buildHubServer(sql: HubSqlPool, opts: HubServerOptions = {}): Fa
     const body = (request.body ?? {}) as Record<string, unknown>
     const lookupKey = typeof body.lookup_key === 'string' ? body.lookup_key : ''
     const quantity = typeof body.quantity === 'number' ? body.quantity : undefined
-    const result = await createCheckoutSession(sql, stripe, { orgId, lookupKey, quantity })
+    const result = await createCheckoutSession(sql, stripe, { orgId, lookupKey, quantity, webOrigin: opts.webOrigin })
     return reply.send(result)
   })
 
   server.post('/api/v1/hub/orgs/:orgId/billing/portal', async (request, reply) => {
     if (!stripe) return reply.code(500).send({ error: 'billing is not configured', code: 'internal_error' })
     const orgId = requireHubOrgId(request)
-    const result = await createPortalSession(sql, stripe, { orgId })
+    const result = await createPortalSession(sql, stripe, { orgId, webOrigin: opts.webOrigin })
     return reply.send(result)
   })
 
