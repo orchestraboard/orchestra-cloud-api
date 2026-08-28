@@ -28,7 +28,7 @@ async function main(): Promise<void> {
   const applied = await hubMigrate(sql)
   if (applied.length > 0) console.log(`applied hub migrations: ${applied.join(', ')}`)
 
-  const server = buildHubServer(sql)
+  const server = buildHubServer(sql, { webOrigin: env.webOrigin })
   await server.listen({ host: '0.0.0.0', port: env.port })
   console.log(`orchestra hub listening on 0.0.0.0:${env.port}`)
 }

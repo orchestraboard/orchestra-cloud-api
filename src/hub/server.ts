@@ -4,6 +4,7 @@ import { hubSyncPlugin } from './routes/sync.js'
 import { HubBroadcaster } from './broadcast.js'
 import { verifyDeviceToken, type HubDevice } from './devices.js'
 import { HubError } from './errors.js'
+import { registerHubCors } from './cors.js'
 import type { HubSqlPool } from './sql.js'
 
 declare module 'fastify' {
@@ -19,6 +20,8 @@ declare module 'fastify' {
 
 export interface HubServerOptions {
   presenceTtlSeconds?: number
+  /** The single browser origin (Vercel-hosted web UI) allowed cross-origin access. See src/hub/cors.ts. */
+  webOrigin?: string
 }
 
 /**
@@ -49,6 +52,13 @@ export function buildHubServer(sql: HubSqlPool, opts: HubServerOptions = {}): Fa
   })
   server.decorateRequest('hubDevice', null)
   server.decorateRequest('hubOrgId', null)
+
+  // Registered before the auth hook below: @fastify/cors answers preflight
+  // OPTIONS requests from its own onRequest hook (registered in call order,
+  // same as the auth hook), so it must run first or a browser's preflight —
+  // sent with no Authorization header — would be rejected by the auth check
+  // before CORS ever got a chance to approve it.
+  registerHubCors(server, opts.webOrigin)
 
   /**
    * One place resolves identity and org scope. Handlers read `request.hubOrgId`
