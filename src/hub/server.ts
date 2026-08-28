@@ -9,7 +9,8 @@ import { hubClerkWebhookPlugin } from './webhooks/clerk.js'
 import { hubStripeWebhookPlugin, type StripeWebhookClient } from './webhooks/stripe.js'
 import { createCheckoutSession, createPortalSession, type StripeBillingClient } from './billing.js'
 import { entitlementsFor } from './entitlements.js'
-import { HubError, ValidationError } from './errors.js'
+import { mintDeviceToken } from './devices.js'
+import { HubError, ValidationError, ForbiddenError } from './errors.js'
 import { registerHubCors } from './cors.js'
 import type { HubSqlPool } from './sql.js'
 
@@ -280,6 +281,55 @@ export function buildHubServer(sql: HubSqlPool, opts: HubServerOptions = {}): Fa
       seats: { used: seatsUsed, entitled: entitlement.seats, overCap: seatsUsed > entitlement.seats },
       agents: { used: agentsUsed, entitled: entitlement.concurrentAgents, overCap: agentsUsed > entitlement.concurrentAgents },
     })
+  })
+
+  // Task 7 defect found while wiring the web UI: nothing exposed the mapping from a
+  // signed-in browser's selected Clerk org to THIS hub's own `orgs.id` (a random
+  // `org_<uuid>` minted by the Clerk `organization.created` webhook — see
+  // webhooks/clerk.ts — never derivable from the Clerk org id the browser actually
+  // has). Every other org-scoped route takes `:orgId` in its path and 403s if it
+  // doesn't match what the token resolves to (see the onRequest hook above), so a
+  // browser that doesn't already know its internal org id has no way to call any of
+  // them. This route has no `:orgId` segment — `requestedOrg` above is therefore
+  // `undefined` and the hook's match check never runs — so it works as the one
+  // bootstrap call a freshly signed-in client makes before every other request.
+  server.get('/api/v1/hub/me', async (request, reply) => {
+    if (!request.hubUserId) {
+      throw new ForbiddenError('sign in required')
+    }
+    return reply.send({ user_id: request.hubUserId, org_id: request.hubOrgId })
+  })
+
+  // Task 7: `mintDeviceToken` (devices.ts) previously had no HTTP route — it was
+  // reachable only from tests, so no daemon could ever obtain a token. Deliberately
+  // restricted to a Clerk-authenticated caller (`request.hubUserId` set): a device
+  // token minting *another* device token has no member behind it to rank for the
+  // seat cap (`assertSeatAvailable` below is then a no-op — see its doc comment in
+  // entitlements.ts), which would let one paired daemon hand out unlimited further
+  // daemons for free. A signed-in member, by contrast, always has exactly one
+  // membership row in their own org, which is what the seat cap actually meters.
+  server.post('/api/v1/hub/orgs/:orgId/devices', async (request, reply) => {
+    const orgId = requireHubOrgId(request)
+    if (!request.hubUserId) {
+      throw new ForbiddenError('only a signed-in member can mint a device token')
+    }
+    const membership = await sql.query<{ id: string }>(
+      'SELECT id FROM memberships WHERE org_id = $1 AND user_id = $2', [orgId, request.hubUserId],
+    )
+    const membershipId = membership.rows[0]?.id
+    if (!membershipId) {
+      throw new ForbiddenError('user is not a member of this org')
+    }
+    const body = (request.body ?? {}) as Record<string, unknown>
+    const name = typeof body.name === 'string' ? body.name : ''
+    // Seat enforcement lives entirely inside `mintDeviceToken` → `assertSeatAvailable`
+    // (entitlements.ts) — not duplicated here. A `ForbiddenError` from an over-cap
+    // member reaches the client via the error handler below with its actionable
+    // message intact (see `INVALID_TOKEN_BODY`'s comment for why *that* path stays
+    // generic — this one is different: the membership already verified above, so
+    // there's no "which token is real" oracle to protect).
+    const { device, token } = await mintDeviceToken(sql, { orgId, membershipId, name })
+    return reply.code(201).send({ device, token })
   })
 
   server.get('/healthz', async () => ({ ok: true, presence_ttl_seconds: opts.presenceTtlSeconds ?? 45 }))
