@@ -37,7 +37,16 @@ const INVALID_TOKEN_BODY = { error: 'device token is not valid', code: 'forbidde
  * single-tenant by construction. Conventions are shared; code is not.
  */
 export function buildHubServer(sql: HubSqlPool, opts: HubServerOptions = {}): FastifyInstance {
-  const server = Fastify()
+  const server = Fastify({
+    // Railway terminates TLS and proxies every request through its edge, so
+    // without this, `request.ip` and `request.protocol` would report the
+    // proxy's address/scheme instead of the client's.
+    trustProxy: true,
+    // Only request metadata (method, url, status, latency) is logged by
+    // Fastify's default serializers — never headers or the body, which carry
+    // bearer tokens (see the auth hook below).
+    logger: true,
+  })
   server.decorateRequest('hubDevice', null)
   server.decorateRequest('hubOrgId', null)
 
