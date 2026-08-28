@@ -37,6 +37,7 @@
     ".codex-plugin",
     "environment-compatibility.json",
     "README.md",
+    "brand/identity/orchestra-mark.svg",
     "docs/agent-os-compatibility-projections.md",
     "docs/agent-os-forward-migrations.md",
     "docs/agent-os-current-baseline.json",
