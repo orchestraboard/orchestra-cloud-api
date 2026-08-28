@@ -76,11 +76,12 @@
     "scripts/package-source-identity.mjs",
     "scripts/retained-package-artifact.mjs",
     "scripts/run-beta-dogfood.mjs",
-    "scripts/tar-artifact-integrity.mjs"
+    "scripts/tar-artifact-integrity.mjs",
+    "scripts/copy-hub-migrations.mjs"
   ],
   "scripts": {
     "baseline:agent-os": "node scripts/capture-agent-os-baseline.mjs",
-    "build": "tsup && node scripts/fix-bin.mjs",
+    "build": "tsup && node scripts/copy-hub-migrations.mjs && node scripts/fix-bin.mjs",
     "package:artifact": "node scripts/package-install-smoke.mjs",
     "benchmark:outcomes": "node scripts/outcome-benchmark.mjs",
     "beta:monitor": "node scripts/beta-release-monitor.mjs",
@@ -106,6 +107,7 @@
     "commander": "^15.0.0",
     "fastify": "^5.10.0",
     "node-pty": "1.2.0-beta.14",
+    "pg": "^8.23.0",
     "picomatch": "^4.0.5",
     "qrcode-terminal": "^0.12.0",
     "web-push": "^3.6.7",
@@ -115,8 +117,10 @@
     "esbuild": "0.28.1"
   },
   "devDependencies": {
+    "@electric-sql/pglite": "^0.2.17",
     "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^26.1.1",
+    "@types/pg": "^8.23.1",
     "@types/picomatch": "^4.0.3",
     "@types/web-push": "^3.6.4",
     "ajv": "^8.20.0",
