@@ -133,6 +133,40 @@ export async function findOrgEventByIdempotencyKey(
   return result.rows[0] ? normalize(result.rows[0]) : null
 }
 
+/**
+ * Idempotent-retry short-circuit: call at the top of every mutating op, before
+ * anything touches the entity's own table. When `idempotencyKey` names an event
+ * this org already recorded, the retried op is presumed to be a replay of that
+ * same call — a daemon's offline queue resends ops after a reconnect, and the
+ * caller may not know whether its first attempt actually committed. Return the
+ * entity exactly as the original call left it (the event's stored payload) and
+ * perform no mutation at all, so a replay never double-applies and never
+ * appends a second event.
+ *
+ * A prior event under the same key but a DIFFERENT kind is not a replay — it's
+ * a key collision (e.g. a client bug that reuses one key across a `createCard`
+ * and a later `sendMail`). That must fail loudly rather than silently hand
+ * back the wrong op's result, so it throws `ConflictError` instead of
+ * returning. `appendOrgEvent`'s own "same key, different payload/kind" check
+ * stays in place as a backstop for the race window where two concurrent calls
+ * with the same key both pass this check before either has committed its
+ * event.
+ *
+ * Shared by every mutating op across `cards.ts` and `mail.ts` — keep it here
+ * rather than forking a per-module copy.
+ */
+export async function replayIfIdempotent<T>(
+  tx: HubSql, orgId: string, idempotencyKey: string | null | undefined, expectedKind: HubEventKind,
+): Promise<T | null> {
+  if (!idempotencyKey) return null
+  const prior = await findOrgEventByIdempotencyKey(tx, orgId, idempotencyKey)
+  if (!prior) return null
+  if (prior.kind !== expectedKind) {
+    throw new ConflictError('idempotency key was already used for a different operation')
+  }
+  return prior.payload as T
+}
+
 /** Events strictly after `since`, oldest first — the daemon's resume read. */
 export async function readOrgEventsSince(
   sql: HubSql, orgId: string, since: number, limit = 500,
