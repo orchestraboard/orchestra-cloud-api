@@ -261,15 +261,21 @@ rest.
 2. **Create an org.** Use Clerk's org creation UI (via `@clerk/react`'s org switcher/creator).
    *Expected:* An `organization.created` webhook fires; check Railway logs for
    `POST /webhooks/clerk` returning `200`, and confirm a row now exists in Supabase's `orgs`
-   table with a matching `clerk_org_id`.
+   table with a matching `clerk_org_id` — **and** that `projects`/`boards` each gained one row
+   named "Default project" for it (`ensureDefaultProject`). A replayed webhook must not add a
+   second one.
 
-3. **Pay in Stripe test mode.** From the app's billing page, click "Upgrade / add seats" (an org
-   with no plan yet — tier `'none'` — always goes through the Cloud checkout path; see the
-   `BillingPage.tsx` tier-aware fix in this task's report). Complete checkout with Stripe's test
-   card `4242 4242 4242 4242`, any future expiry, any CVC.
+3. **Pay in Stripe test mode.** From the app's billing page, click **"Subscribe"**. That button
+   appears only for an org with no subscription at all (`subscribed: false` on
+   `GET /orgs/:orgId/entitlements`); an org that already has one shows "Manage plan and seats"
+   and goes to the Stripe portal instead — starting a second checkout would create a second
+   subscription against the same customer, and the server refuses it with a `400`. Complete
+   checkout with Stripe's test card `4242 4242 4242 4242`, any future expiry, any CVC.
    *Expected:* Redirect lands back on the Vercel app's own billing page
    (`${WEB_ORIGIN}/billing?checkout=success` — see
-   [`WEB_ORIGIN` drives checkout/portal redirects](#web_origin-drives-checkoutportal-redirects)).
+   [`WEB_ORIGIN` drives checkout/portal redirects](#web_origin-drives-checkoutportal-redirects)),
+   which shows a "Payment received" acknowledgement. That path is served by `vercel.json`'s SPA
+   rewrite; without it Vercel's static output has no `/billing` file and would 404.
    Also check Railway logs for `POST /webhooks/stripe` (`checkout.session.completed`)
    returning `200`, and confirm Supabase's `subscriptions` table now has a row for this org with
    `tier = 'cloud'` and `status = 'active'`.
@@ -280,42 +286,76 @@ rest.
 
 5. **Mint a device token** (simulating "join a daemon"). While signed in as an org member, call:
    ```bash
-   curl -X POST "https://<railway-url>/api/v1/hub/orgs/<orgId>/devices" \
+   curl -i -X POST "https://<railway-url>/api/v1/hub/orgs/<orgId>/devices" \
      -H "Authorization: Bearer <clerk-session-jwt>" \
      -H "Content-Type: application/json" \
      -d '{"name": "smoke-test-daemon"}'
    ```
-   *Expected:* `200` with a `token` field prefixed `orchestra_device_v1.`. Save it as
-   `$DEVICE_TOKEN`.
+   *Expected:* **`201`** (not `200` — the route answers `reply.code(201)`) with a `token` field
+   prefixed `orchestra_device_v1.`. Save it as `$DEVICE_TOKEN`. Note this must be a **Clerk
+   session JWT**: a device token cannot mint another device token, cannot create a project, and
+   cannot reach either billing route.
 
-6. **Create a card "from one machine"** using that device token as the daemon would:
+6. **Get a board id.** Every org created through Clerk gets a default project and board
+   automatically (the `organization.created` webhook calls `ensureDefaultProject` —
+   `src/hub/projects.ts`), so one already exists:
    ```bash
-   curl -X POST "https://<railway-url>/api/v1/hub/orgs/<orgId>/ops" \
+   curl "https://<railway-url>/api/v1/hub/orgs/<orgId>/boards" \
+     -H "Authorization: Bearer <clerk-session-jwt>"
+   ```
+   *Expected:* `200` with `{"boards": [{"id": "board_…", "project_name": "Default project", …}]}`.
+   Save the `id` as `$BOARD_ID`. To make another, `POST /api/v1/hub/orgs/<orgId>/projects` with
+   `{"name": "…"}` returns `201` and `{project, board}` (a Clerk JWT, and the org must have an
+   active subscription — creating a project is a write).
+
+7. **Create a card "from one machine"** using that device token as the daemon would:
+   ```bash
+   curl -i -X POST "https://<railway-url>/api/v1/hub/orgs/<orgId>/ops" \
      -H "Authorization: Bearer $DEVICE_TOKEN" \
      -H "Content-Type: application/json" \
-     -d '{"op": "card.create", "payload": {"boardId": "<boardId>", "title": "smoke test card"}}'
+     -d '{"op": "card.create", "payload": {"board_id": "'"$BOARD_ID"'", "title": "smoke test card"}}'
    ```
-   *Expected:* `200` with the created card and a `seq`. (`<boardId>` must already exist for the
-   org — get one from `GET /api/v1/hub/orgs/<orgId>/cards` or the app's own board view.)
+   *Expected:* `200` with the created card and a `seq`. The payload key is **`board_id`**, snake
+   case — `runOp` in `src/hub/routes/ops.ts` reads `payload.board_id`; a `boardId` key resolves
+   to `undefined` and the request fails with a `card.create` validation error, not a card.
 
-7. **See it on another machine.** In a **second** browser session (or a private window) signed in
+8. **See it on another machine.** In a **second** browser session (or a private window) signed in
    as a different member of the same org, open the board.
    *Expected:* "smoke test card" appears without a manual refresh — this is what
    `GET /orgs/:orgId/sync` (`src/hub/routes/sync.ts`) exists for. If it only appears after a
    manual reload, the sync/broadcast path — not this task's deploy config — is the thing to
    debug.
 
-8. **Suspended org serves reads, refuses writes** (explicit Done Criteria item). In the Stripe
+9. **Suspended org serves reads, refuses writes** (explicit Done Criteria item). In the Stripe
    dashboard, cancel the test subscription (or let it lapse). Confirm the `customer.subscription.
    deleted` webhook flips `orgs.status` to `'suspended'` (`syncSubscriptionFromStripe`).
    *Expected:* `GET /api/v1/hub/orgs/<orgId>/cards` still returns `200`; `POST .../ops` returns
    an error from `assertOrgWritable` (`src/hub/entitlements.ts`) rather than succeeding.
 
-9. **Removing a member in Clerk revokes their device token** (explicit Done Criteria item).
-   Remove the smoke-test member from the org via Clerk's dashboard.
-   *Expected:* The `organizationMembership.deleted` webhook cascades `memberships` →
-   `devices` (`ON DELETE CASCADE`); the same `$DEVICE_TOKEN` from step 5 now gets `403` on any
-   `/api/v1/hub/...` call.
+10. **Removing a member in Clerk revokes their device token** (explicit Done Criteria item).
+    Remove the smoke-test member from the org via Clerk's dashboard.
+    *Expected:* The `organizationMembership.deleted` webhook cascades `memberships` →
+    `devices` (`ON DELETE CASCADE`); the same `$DEVICE_TOKEN` from step 5 now gets `403` on any
+    `/api/v1/hub/...` call.
+
+11. **A leaked device token can be revoked without removing anyone.** Mint a second token as in
+    step 5, then, as a signed-in member:
+    ```bash
+    curl "https://<railway-url>/api/v1/hub/orgs/<orgId>/devices" \
+      -H "Authorization: Bearer <clerk-session-jwt>"
+    curl -i -X DELETE "https://<railway-url>/api/v1/hub/orgs/<orgId>/devices/<deviceId>" \
+      -H "Authorization: Bearer <clerk-session-jwt>"
+    ```
+    *Expected:* the listing returns `200` and never contains a `token_hash`; the delete returns
+    `204`, and that token now gets `403` on its very next request while every other device keeps
+    working. An owner/admin may revoke any device in the org; a plain member may revoke only
+    devices minted against their own membership (anything else is a `404`).
+
+12. **Not paying does not beat paying.** Create a second Clerk org and do NOT subscribe.
+    *Expected:* `GET .../cards` and `GET .../boards` return `200`, the billing page loads, and
+    `GET .../entitlements` reports `"subscribed": false` — but every `POST .../ops` returns
+    `403` naming "no subscription" and pointing at checkout. Before this, such an org got 5
+    seats and 15 concurrent agents free and forever, more than Cloud's paid entry tier.
 
 Record the actual result of each numbered step here once run — pass/fail, and for a failure, the
 exact response body/log line, not a paraphrase.

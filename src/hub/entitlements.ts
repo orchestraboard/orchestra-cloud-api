@@ -129,15 +129,38 @@ export async function entitlementsFor(sql: HubSql, orgId: string): Promise<Entit
 }
 
 /**
- * Throws `ForbiddenError` when an org's billing has lapsed. Deliberately checks only
- * `orgs.status` — reads never call this, so a suspended org still serves every GET
- * route; only whatever calls this (the ops endpoint, for every op it accepts) is
- * blocked. Nobody's data is held hostage over a billing lapse, but nothing new can
- * be written until it's resolved.
+ * Throws `ForbiddenError` when an org may not write — either because it never subscribed,
+ * or because its subscription lapsed.
+ *
+ * Reads never call this, so both refusals still serve every GET route, and the billing
+ * routes are deliberately outside it too: an org has to be able to load its billing page
+ * and reach checkout/portal in order to fix the reason it was refused. Nobody's data is
+ * held hostage; nothing new can be written until it's resolved.
+ *
+ * **Never-subscribed is not the `'none'` tier case.** An org whose `subscriptions` row
+ * exists but whose tier this hub doesn't recognize keeps its cached entitlements and keeps
+ * writing (see `resolveEntitlement`) — wrongly suspending a paying customer over catalogue
+ * drift is worse than a generous limit. An org with NO row has never paid at all, and until
+ * this check existed, not paying was strictly better than paying: `resolveEntitlement`'s
+ * `orgs.seat_cap` fallback handed it 5 seats and 15 concurrent agents, permanently, against
+ * the 3 seats and 9 agents Cloud's $20/mo base tier buys. Row existence is the whole test —
+ * it is written only by `syncSubscriptionFromStripe` off a verified Stripe webhook.
  */
 export async function assertOrgWritable(sql: HubSql, orgId: string): Promise<void> {
-  const result = await sql.query<{ status: string }>('SELECT status FROM orgs WHERE id = $1', [orgId])
-  if (result.rows[0]?.status === 'suspended') {
+  const result = await sql.query<{ status: string; has_subscription: boolean }>(
+    `SELECT o.status, (s.org_id IS NOT NULL) AS has_subscription
+     FROM orgs o LEFT JOIN subscriptions s ON s.org_id = o.id
+     WHERE o.id = $1`,
+    [orgId],
+  )
+  const row = result.rows[0]
+  if (row && !row.has_subscription) {
+    throw new ForbiddenError(
+      'this org has no subscription — writes are disabled until one is started. Open the billing '
+      + 'page and complete checkout to enable them (reads and billing still work).',
+    )
+  }
+  if (row?.status === 'suspended') {
     throw new ForbiddenError(
       'this org\'s subscription is suspended — writes are disabled until billing is restored (reads still work)',
     )

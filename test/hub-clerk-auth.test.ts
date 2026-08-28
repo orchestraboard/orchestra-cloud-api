@@ -4,7 +4,7 @@ import { buildHubServer } from '../src/hub/server.js'
 import { resolveOrgForClerk } from '../src/hub/clerk.js'
 import { mintDeviceToken } from '../src/hub/devices.js'
 import { hubFixture, closeHubServers } from './support/hub-fixture.js'
-import { hubTestSql, seedOrg, seedBoard, seedUser, seedMembership } from './support/hub-sql.js'
+import { hubTestSql, seedOrg, seedBoard, seedUser, seedMembership, seedSubscription } from './support/hub-sql.js'
 
 // `@clerk/backend`'s `verifyToken` is the only network/crypto boundary Task 3
 // crosses. Mocking it here means every test in this file runs with no network
@@ -66,6 +66,9 @@ afterEach(async () => {
 async function clerkFixture(secretKey: string | null = CLERK_SECRET) {
   const sql = await hubTestSql()
   await seedOrg(sql, 'org_a', 'clerk_org_a')
+  // Without a subscription this org is refused every write (`assertOrgWritable`), which
+  // would make the ops assertions below fail for a reason that has nothing to do with auth.
+  await seedSubscription(sql, 'org_a')
   await seedBoard(sql, 'org_a', 'board_1')
   await seedUser(sql, 'user_1', 'clerk_user_1')
   await seedMembership(sql, 'mem_1', 'org_a', 'user_1')

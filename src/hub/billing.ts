@@ -143,6 +143,7 @@ export async function createCheckoutSession(
   }
   const quantity = normalizeQuantity(params.quantity)
   const webOrigin = requireWebOrigin(params.webOrigin)
+  await refuseSecondSubscription(sql, params.orgId)
 
   const prices = await stripe.prices.list({ lookup_keys: [params.lookupKey], expand: ['data.product'] })
   const price = prices.data[0]
@@ -228,7 +229,9 @@ export async function syncSubscriptionFromStripe(
 
   const quantities = deriveQuantities(subscription.items.data, logger, subscription.id)
   const periodEnd = maxCurrentPeriodEnd(subscription.items.data)
-  const orgActive = subscription.status === 'active' || subscription.status === 'trialing'
+  // See `SUSPENDING_SUBSCRIPTION_STATUS`: writable is the default and only the terminal statuses
+  // suspend, so a `past_due` customer Stripe is still retrying keeps working.
+  const orgActive = !subscriptionSuspendsOrg(subscription.status)
   const customerId = resolveCustomerId(subscription.customer)
 
   if (quantities.tier === 'none') {
@@ -278,6 +281,60 @@ export async function syncSubscriptionFromStripe(
   }
 
   await sql.query('UPDATE orgs SET status = $1 WHERE id = $2', [orgActive ? 'active' : 'suspended', orgId])
+}
+
+/**
+ * Statuses that mean this org's subscription is not paying for anything any more, so
+ * `orgs.status` goes to `'suspended'` and writes stop.
+ *
+ * Everything NOT listed here stays writable — including `past_due` and `incomplete`, which
+ * is the point. Stripe sets `past_due` on the FIRST failed charge and then smart-retries
+ * for two to three weeks; treating only `active`/`trialing` as good (as this did) suspended
+ * a real, paying customer mid-dunning over one declined card, before Stripe had even given
+ * up. `incomplete` is the same shape at the other end of the lifecycle: the first payment
+ * hasn't confirmed yet (SCA, say), not that it failed.
+ *
+ * `incomplete_expired` and `paused` join `canceled`/`unpaid` because in all four Stripe has
+ * stopped trying and no money is flowing. An unrecognized status is deliberately treated as
+ * writable: a wrong suspension of a paying customer is worse than a generous window on a
+ * status this code has never seen, the same asymmetry `syncSubscriptionFromStripe` already
+ * applies to an unrecognized tier.
+ */
+const SUSPENDING_SUBSCRIPTION_STATUS = new Set(['canceled', 'unpaid', 'incomplete_expired', 'paused'])
+
+/** Exported for the entitlement/webhook tests, and so nothing has to re-list these strings. */
+export function subscriptionSuspendsOrg(status: string): boolean {
+  return SUSPENDING_SUBSCRIPTION_STATUS.has(status)
+}
+
+/**
+ * Refuses a checkout for an org that already has a live subscription, pointing the caller at
+ * the billing portal instead.
+ *
+ * The UI is not allowed to be the only thing enforcing this. `subscriptions.org_id` is a
+ * PRIMARY KEY, so a second Stripe subscription against the same customer would sync onto the
+ * SAME row: the second (base-only) subscription's quantities overwrite the first's, and every
+ * extra seat and agent pack the customer already paid for silently becomes 0. Cancelling
+ * either one then suspends the org while the other keeps billing. This is a `ValidationError`
+ * (400) rather than a 500 — it is an expected request state with an obvious next action.
+ *
+ * `stripe_subscription_id IS NOT NULL` is part of the test on purpose: a `subscriptions` row
+ * can exist with only a cached `stripe_customer_id` (schema default status `'inactive'`, no
+ * subscription ever completed), and that org must still be able to check out.
+ */
+async function refuseSecondSubscription(sql: HubSqlPool, orgId: string): Promise<void> {
+  const result = await sql.query<{ status: string; stripe_subscription_id: string | null }>(
+    'SELECT status, stripe_subscription_id FROM subscriptions WHERE org_id = $1', [orgId],
+  )
+  const row = result.rows[0]
+  if (!row?.stripe_subscription_id) return
+  if (subscriptionSuspendsOrg(row.status)) return
+
+  throw new ValidationError(
+    'this org already has an active subscription — use the billing portal to change your plan, '
+    + 'seats, or payment method. Starting a second checkout would create a second subscription '
+    + 'against the same customer and overwrite the entitlements you have already paid for.',
+  )
 }
 
 function normalizeQuantity(raw: number | undefined): number {

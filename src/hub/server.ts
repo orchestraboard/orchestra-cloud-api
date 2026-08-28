@@ -8,9 +8,10 @@ import { verifyClerkToken, resolveOrgForClerk } from './clerk.js'
 import { hubClerkWebhookPlugin } from './webhooks/clerk.js'
 import { hubStripeWebhookPlugin, type StripeWebhookClient } from './webhooks/stripe.js'
 import { createCheckoutSession, createPortalSession, type StripeBillingClient } from './billing.js'
-import { entitlementsFor } from './entitlements.js'
-import { mintDeviceToken } from './devices.js'
-import { HubError, ValidationError, ForbiddenError } from './errors.js'
+import { assertOrgWritable, entitlementsFor } from './entitlements.js'
+import { mintDeviceToken, revokeDevice } from './devices.js'
+import { createProject, listBoards } from './projects.js'
+import { HubError, ValidationError, ForbiddenError, NotFoundError } from './errors.js'
 import { registerHubCors } from './cors.js'
 import type { HubSqlPool } from './sql.js'
 
@@ -236,6 +237,7 @@ export function buildHubServer(sql: HubSqlPool, opts: HubServerOptions = {}): Fa
   server.post('/api/v1/hub/orgs/:orgId/billing/checkout', async (request, reply) => {
     if (!stripe) return reply.code(500).send({ error: 'billing is not configured', code: 'internal_error' })
     const orgId = requireHubOrgId(request)
+    await requireMembership(sql, request, orgId, BILLING_ROLES.checkout)
     const body = (request.body ?? {}) as Record<string, unknown>
     const lookupKey = typeof body.lookup_key === 'string' ? body.lookup_key : ''
     const quantity = typeof body.quantity === 'number' ? body.quantity : undefined
@@ -246,6 +248,7 @@ export function buildHubServer(sql: HubSqlPool, opts: HubServerOptions = {}): Fa
   server.post('/api/v1/hub/orgs/:orgId/billing/portal', async (request, reply) => {
     if (!stripe) return reply.code(500).send({ error: 'billing is not configured', code: 'internal_error' })
     const orgId = requireHubOrgId(request)
+    await requireMembership(sql, request, orgId, BILLING_ROLES.portal)
     const result = await createPortalSession(sql, stripe, { orgId, webOrigin: opts.webOrigin })
     return reply.send(result)
   })
@@ -270,6 +273,11 @@ export function buildHubServer(sql: HubSqlPool, opts: HubServerOptions = {}): Fa
     const agentsUsed = Number(agents.rows[0]?.n ?? 0)
     return reply.send({
       tier: subscription.rows[0]?.tier ?? 'none',
+      // Distinct from `tier: 'none'`, which also covers an org whose subscription exists but
+      // whose lookup keys this hub doesn't recognize. `subscribed: false` means no Stripe
+      // subscription has EVER synced for this org, which is exactly the state
+      // `assertOrgWritable` refuses writes for — the billing page needs to be able to say so.
+      subscribed: subscription.rows.length > 0,
       status: entitlement.status,
       sso: entitlement.sso,
       // `overCap` on seats: memberships are never gated at creation (Clerk owns
@@ -310,16 +318,7 @@ export function buildHubServer(sql: HubSqlPool, opts: HubServerOptions = {}): Fa
   // membership row in their own org, which is what the seat cap actually meters.
   server.post('/api/v1/hub/orgs/:orgId/devices', async (request, reply) => {
     const orgId = requireHubOrgId(request)
-    if (!request.hubUserId) {
-      throw new ForbiddenError('only a signed-in member can mint a device token')
-    }
-    const membership = await sql.query<{ id: string }>(
-      'SELECT id FROM memberships WHERE org_id = $1 AND user_id = $2', [orgId, request.hubUserId],
-    )
-    const membershipId = membership.rows[0]?.id
-    if (!membershipId) {
-      throw new ForbiddenError('user is not a member of this org')
-    }
+    const { membershipId } = await requireMembership(sql, request, orgId)
     const body = (request.body ?? {}) as Record<string, unknown>
     const name = typeof body.name === 'string' ? body.name : ''
     // Seat enforcement lives entirely inside `mintDeviceToken` → `assertSeatAvailable`
@@ -332,6 +331,83 @@ export function buildHubServer(sql: HubSqlPool, opts: HubServerOptions = {}): Fa
     return reply.code(201).send({ device, token })
   })
 
+  /**
+   * Every device paired to this org, so a member can SEE what holds a token before deciding
+   * to revoke one. Never returns `token_hash` — the columns are picked explicitly rather
+   * than `SELECT *` so a future column can't leak into this response by accident.
+   */
+  server.get('/api/v1/hub/orgs/:orgId/devices', async (request, reply) => {
+    const orgId = requireHubOrgId(request)
+    await requireMembership(sql, request, orgId)
+    const devices = await sql.query(
+      `SELECT id, org_id, membership_id, name, created_at, last_seen_at, revoked_at
+       FROM devices WHERE org_id = $1 ORDER BY created_at ASC, id ASC`,
+      [orgId],
+    )
+    return reply.send({ devices: devices.rows })
+  })
+
+  /**
+   * Revokes one device token. `revokeDevice` (devices.ts) existed from Task 2 with no caller
+   * outside its tests — meaning a leaked device token, which never expires, could not be
+   * revoked through the product at all: the only remedy was removing the member from Clerk
+   * (cascading away ALL their devices) or a manual `UPDATE` against the database.
+   *
+   * An owner/admin may revoke any device in the org; a plain member may revoke only devices
+   * minted against their own membership, so the person who leaked a token can always kill it
+   * without waiting for an admin. `revokeDevice` scopes its own UPDATE by `org_id` as well,
+   * so a device id from another org is a 404 and not an existence oracle (see scope.ts).
+   */
+  server.delete('/api/v1/hub/orgs/:orgId/devices/:deviceId', async (request, reply) => {
+    const orgId = requireHubOrgId(request)
+    const { membershipId, role } = await requireMembership(sql, request, orgId)
+    const deviceId = (request.params as { deviceId?: string }).deviceId ?? ''
+
+    if (role !== 'owner' && role !== 'admin') {
+      const owned = await sql.query<{ id: string }>(
+        'SELECT id FROM devices WHERE org_id = $1 AND id = $2 AND membership_id = $3',
+        [orgId, deviceId, membershipId],
+      )
+      // Same wording a missing device gets, deliberately: a member must not learn that a
+      // device they may not touch exists.
+      if (!owned.rows[0]) throw new NotFoundError('device not found in this org')
+    }
+
+    await revokeDevice(sql, orgId, deviceId)
+    return reply.code(204).send()
+  })
+
+  /**
+   * Creates a project and its first board. Until this route there was NO way to create
+   * either one over HTTP: every write op requires a `board_id` that already exists, so a
+   * customer who paid had nothing to point a daemon at (see src/hub/projects.ts).
+   *
+   * Gated on `assertOrgWritable` like any other write — a never-subscribed or suspended org
+   * cannot add projects — which is safe precisely because it is not the only way to get a
+   * board: `organization.created` seeds a default one (webhooks/clerk.ts), so nobody is
+   * ever stranded with zero boards while they sort billing out.
+   */
+  server.post('/api/v1/hub/orgs/:orgId/projects', async (request, reply) => {
+    const orgId = requireHubOrgId(request)
+    await requireMembership(sql, request, orgId)
+    await assertOrgWritable(sql, orgId)
+    const body = (request.body ?? {}) as Record<string, unknown>
+    const created = await createProject(sql, {
+      orgId,
+      name: typeof body.name === 'string' ? body.name : '',
+      boardName: typeof body.board_name === 'string' ? body.board_name : undefined,
+      repoFingerprint: typeof body.repo_fingerprint === 'string' ? body.repo_fingerprint : undefined,
+    })
+    return reply.code(201).send(created)
+  })
+
+  /** A read (never gated on writability, same as the other org-scoped GETs): how a client or
+   * the hosting runbook discovers a real `board_id` instead of guessing one. */
+  server.get('/api/v1/hub/orgs/:orgId/boards', async (request, reply) => {
+    const orgId = requireHubOrgId(request)
+    return reply.send({ boards: await listBoards(sql, orgId) })
+  })
+
   server.get('/healthz', async () => ({ ok: true, presence_ttl_seconds: opts.presenceTtlSeconds ?? 45 }))
 
   return server
@@ -341,6 +417,55 @@ function requireHubOrgId(request: FastifyRequest): string {
   const orgId = request.hubOrgId
   if (!orgId) throw new ValidationError('org scope was not resolved')
   return orgId
+}
+
+export type HubRole = 'owner' | 'admin' | 'member'
+
+/**
+ * Which roles may reach each billing route.
+ *
+ * Both entries exclude device tokens outright (see `requireMembership`). A device token is
+ * long-lived, never expires, and the hosting runbook has people paste it by hand into a
+ * laptop config — yet before this, its holder could open the Stripe billing portal and
+ * cancel the plan, swap the payment method, or read invoices carrying the billing address,
+ * because the auth hook accepts device tokens on every `/api/v1/hub/` path and these two
+ * routes checked only org scope. Nothing a daemon does needs billing.
+ *
+ * The portal narrows further to owner/admin: `memberships.role` has been mirrored
+ * faithfully from Clerk since Task 4 (webhooks/clerk.ts) and read nowhere, and the portal is
+ * where a subscription is actually cancelled. Checkout stays open to any member — starting a
+ * subscription for an org that has none is not destructive, and `createCheckoutSession`
+ * refuses a second one anyway (billing.ts).
+ */
+const BILLING_ROLES = {
+  checkout: null,
+  portal: ['owner', 'admin'] as const,
+} as const
+
+/**
+ * Resolves the caller to a real `memberships` row, or throws.
+ *
+ * This is where "a Clerk principal, not a device token" is enforced: `request.hubUserId` is
+ * set only by the Clerk branch of the auth hook. `allowedRoles` narrows further when a route
+ * needs it; `null` means any member of the org.
+ */
+async function requireMembership(
+  sql: HubSqlPool, request: FastifyRequest, orgId: string, allowedRoles: readonly HubRole[] | null = null,
+): Promise<{ membershipId: string; role: HubRole }> {
+  if (!request.hubUserId) {
+    throw new ForbiddenError('only a signed-in member can do this — a device token cannot')
+  }
+  const membership = await sql.query<{ id: string; role: HubRole }>(
+    'SELECT id, role FROM memberships WHERE org_id = $1 AND user_id = $2', [orgId, request.hubUserId],
+  )
+  const row = membership.rows[0]
+  if (!row) throw new ForbiddenError('user is not a member of this org')
+  if (allowedRoles && !allowedRoles.includes(row.role)) {
+    throw new ForbiddenError(
+      `this action requires the ${allowedRoles.join(' or ')} role in this org; you are a ${row.role}`,
+    )
+  }
+  return { membershipId: row.id, role: row.role }
 }
 
 /**

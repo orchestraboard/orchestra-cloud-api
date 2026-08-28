@@ -5,12 +5,24 @@ import { mintDeviceToken } from '../src/hub/devices.js'
 import { ForbiddenError, NotFoundError } from '../src/hub/errors.js'
 import { hubTestSql, seedOrg, seedBoard, seedUser, seedMembership } from './support/hub-sql.js'
 import { hubFixture, closeHubServers } from './support/hub-fixture.js'
+import { buildHubServer } from '../src/hub/server.js'
+import type { FastifyInstance } from 'fastify'
 import type { HubSql, HubSqlPool } from '../src/hub/sql.js'
 
-afterEach(async () => { await closeHubServers() })
+/** Servers built directly here rather than through `hubFixture` (which always seeds a
+ * subscription) — the never-subscribed cases need an org without one. */
+const hubServers: FastifyInstance[] = []
+
+afterEach(async () => {
+  await closeHubServers()
+  for (const server of hubServers.splice(0)) await server.close()
+})
 
 /** Inserts (or upserts) a `subscriptions` row with only the columns a test cares
- * about — everything else takes the schema default (0 / false / 'none'). */
+ * about — everything else takes the schema default (0 / false / 'none'). Upserts rather
+ * than inserts because `hubFixture` now seeds a baseline subscription of its own (an org
+ * with none is refused every write — see `assertOrgWritable`), so tests that want
+ * different numbers are overwriting a row that already exists. */
 async function seedSubscription(
   sql: HubSql, orgId: string,
   fields: Partial<{
@@ -20,7 +32,11 @@ async function seedSubscription(
 ): Promise<void> {
   await sql.query(
     `INSERT INTO subscriptions (org_id, tier, seats_included, seats_purchased, agent_packs, sso_enabled)
-     VALUES ($1, $2, $3, $4, $5, $6)`,
+     VALUES ($1, $2, $3, $4, $5, $6)
+     ON CONFLICT (org_id) DO UPDATE SET
+       tier = excluded.tier, seats_included = excluded.seats_included,
+       seats_purchased = excluded.seats_purchased, agent_packs = excluded.agent_packs,
+       sso_enabled = excluded.sso_enabled`,
     [
       orgId, fields.tier ?? 'none', fields.seatsIncluded ?? 0, fields.seatsPurchased ?? 0,
       fields.agentPacks ?? 0, fields.ssoEnabled ?? false,
@@ -146,18 +162,66 @@ describe('entitlementsFor', () => {
 })
 
 describe('assertOrgWritable', () => {
-  it('does not throw for an active org', async () => {
+  it('does not throw for an active, subscribed org', async () => {
     const sql = await hubTestSql()
     await seedOrg(sql, 'org_a')
+    await seedSubscription(sql, 'org_a', { tier: 'cloud', seatsIncluded: 3 })
     await expect(assertOrgWritable(sql, 'org_a')).resolves.toBeUndefined()
   })
 
   it('throws ForbiddenError for a suspended org', async () => {
     const sql = await hubTestSql()
     await seedOrg(sql, 'org_a')
+    await seedSubscription(sql, 'org_a', { tier: 'cloud', seatsIncluded: 3 })
     await sql.query("UPDATE orgs SET status = 'suspended' WHERE id = $1", ['org_a'])
 
     await expect(assertOrgWritable(sql, 'org_a')).rejects.toBeInstanceOf(ForbiddenError)
+  })
+
+  it('refuses writes for an org that has never had a subscription, naming the reason and pointing at checkout', async () => {
+    const sql = await hubTestSql()
+    await seedOrg(sql, 'org_a')
+
+    await expect(assertOrgWritable(sql, 'org_a')).rejects.toThrow(/no subscription/)
+    await expect(assertOrgWritable(sql, 'org_a')).rejects.toThrow(/billing page|checkout/)
+  })
+
+  it('a never-subscribed org is NOT the same as the ruled-on "none" tier: an unrecognized tier keeps writing', async () => {
+    const sql = await hubTestSql()
+    await seedOrg(sql, 'org_a')
+    // A row that synced from a real Stripe subscription whose lookup keys this hub does not
+    // recognize. Wrongly suspending a paying customer over catalogue drift is worse than a
+    // generous limit — see resolveEntitlement. Never-subscribed is a different state.
+    await seedSubscription(sql, 'org_a', { tier: 'none', seatsIncluded: 3, seatsPurchased: 2 })
+
+    await expect(assertOrgWritable(sql, 'org_a')).resolves.toBeUndefined()
+    await expect(entitlementsFor(sql, 'org_a')).resolves.toMatchObject({ seats: 5 })
+  })
+
+  it('HTTP: a never-subscribed org is refused every op but still serves reads and its billing page', async () => {
+    const sql = await hubTestSql()
+    await seedOrg(sql, 'org_a')
+    await seedBoard(sql, 'org_a', 'board_1')
+    const { token } = await mintDeviceToken(sql as HubSqlPool, { orgId: 'org_a', name: 'laptop' })
+    const server = buildHubServer(sql as HubSqlPool)
+    hubServers.push(server)
+    await server.ready()
+    const auth = { authorization: `Bearer ${token}` }
+
+    const write = await server.inject({
+      method: 'POST', url: '/api/v1/hub/orgs/org_a/ops', headers: auth,
+      payload: { op: 'card.create', payload: { board_id: 'board_1', title: 'x' } },
+    })
+    expect(write.statusCode).toBe(403)
+    expect(write.json().error).toMatch(/no subscription/)
+
+    const read = await server.inject({ method: 'GET', url: '/api/v1/hub/orgs/org_a/cards', headers: auth })
+    expect(read.statusCode).toBe(200)
+    const entitlements = await server.inject({
+      method: 'GET', url: '/api/v1/hub/orgs/org_a/entitlements', headers: auth,
+    })
+    expect(entitlements.statusCode).toBe(200)
+    expect(entitlements.json().subscribed).toBe(false)
   })
 
   it('HTTP: a suspended org refuses every op through the ops endpoint (403)', async () => {

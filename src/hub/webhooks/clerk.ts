@@ -9,6 +9,7 @@ import type {
   DeletedObjectJSON,
   WebhookEvent,
 } from '@clerk/backend'
+import { ensureDefaultProject } from '../projects.js'
 import { withTransaction, type HubSql, type HubSqlPool } from '../sql.js'
 
 export interface HubClerkWebhookEnv {
@@ -126,7 +127,7 @@ async function applyClerkEvent(sql: HubSqlPool, event: WebhookEvent, request: Fa
         return
       case 'organization.created':
       case 'organization.updated':
-        await upsertOrg(tx, event.data as OrganizationJSON)
+        await upsertOrg(tx, event.data as OrganizationJSON, event.type === 'organization.created', request)
         return
       case 'organization.deleted':
         await deleteOrg(tx, event.data as DeletedObjectJSON)
@@ -167,13 +168,36 @@ async function deleteUser(tx: HubSql, data: UserDeletedJSON): Promise<void> {
   await tx.query('DELETE FROM users WHERE clerk_user_id = $1', [data.id])
 }
 
-async function upsertOrg(tx: HubSql, data: OrganizationJSON): Promise<void> {
-  await tx.query(
+/**
+ * On `organization.created`, this also gives the org a default project and board.
+ *
+ * Without it a paying customer lands on an empty org with no board, and every write op
+ * (which all require an existing `board_id` — see src/hub/projects.ts) is unsatisfiable:
+ * there was no way at all to create one. `RETURNING id` on the upsert covers the replay
+ * case too — Clerk retries any non-2xx, so `organization.created` can arrive more than
+ * once — because `ensureDefaultProject` no-ops when the org already has a project, and
+ * runs inside this handler's transaction on the org row this statement just wrote.
+ */
+async function upsertOrg(
+  tx: HubSql, data: OrganizationJSON, created: boolean, request: FastifyRequest,
+): Promise<void> {
+  const org = await tx.query<{ id: string }>(
     `INSERT INTO orgs (id, clerk_org_id, name, slug)
      VALUES ($1, $2, $3, $4)
-     ON CONFLICT (clerk_org_id) DO UPDATE SET name = excluded.name, slug = excluded.slug`,
+     ON CONFLICT (clerk_org_id) DO UPDATE SET name = excluded.name, slug = excluded.slug
+     RETURNING id`,
     [`org_${randomUUID()}`, data.id, data.name, data.slug],
   )
+  const orgId = org.rows[0]?.id
+  if (!created || !orgId) return
+
+  const seeded = await ensureDefaultProject(tx, orgId)
+  if (seeded) {
+    request.log.info(
+      { orgId, projectId: seeded.project.id, boardId: seeded.board.id },
+      'clerk webhook: seeded the default project and board for a new org',
+    )
+  }
 }
 
 async function deleteOrg(tx: HubSql, data: DeletedObjectJSON): Promise<void> {
