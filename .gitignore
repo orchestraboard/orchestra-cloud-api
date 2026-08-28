@@ -5,6 +5,10 @@ web/node_modules/
 *.db
 artifacts/qa/browser-quality/
 
+# secrets: Clerk keys land in web/.env.local via `clerk init`. Never commit them.
+.env.local
+.env*.local
+
 # local tooling (not part of the published project)
 .gitnexus/
 .playwright-mcp/
