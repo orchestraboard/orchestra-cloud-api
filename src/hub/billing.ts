@@ -85,6 +85,22 @@ export interface CreatePortalSessionParams {
   returnUrl?: string
 }
 
+/** `'none'` means the subscription's items contained no lookup key this hub recognizes yet —
+ * see `deriveQuantities`'s handling of that case. */
+export type SubscriptionTier = 'cloud' | 'business' | 'none'
+
+/** Where `syncSubscriptionFromStripe` reports conditions worth a human's attention — a mixed-
+ * tier subscription, or one with no recognized lookup key. Defaults to `console.warn`; the
+ * webhook plugin passes an adapter over `request.log` so these land in the same structured
+ * request-scoped logs as everything else Fastify logs. */
+export interface SyncLogger {
+  warn(message: string, meta?: Record<string, unknown>): void
+}
+
+const consoleSyncLogger: SyncLogger = {
+  warn: (message, meta) => console.warn(message, meta ?? {}),
+}
+
 /**
  * Creates a Stripe Checkout Session for one line item, resolved by lookup key.
  *
@@ -172,7 +188,9 @@ export async function createPortalSession(
  * quantity field — the subscription is multi-line (base + extra seats + agent packs + optional
  * SSO), so any single quantity would be wrong.
  */
-export async function syncSubscriptionFromStripe(sql: HubSqlPool, subscription: StripeSubscriptionLike): Promise<void> {
+export async function syncSubscriptionFromStripe(
+  sql: HubSqlPool, subscription: StripeSubscriptionLike, logger: SyncLogger = consoleSyncLogger,
+): Promise<void> {
   const orgId = await resolveOrgIdForSubscription(sql, subscription)
   if (!orgId) {
     // No org in the mirror claims this subscription (by metadata.orgId or by a previously
@@ -183,31 +201,56 @@ export async function syncSubscriptionFromStripe(sql: HubSqlPool, subscription: 
     return
   }
 
-  const { seatsIncluded, seatsPurchased, agentPacks, ssoEnabled } = deriveQuantities(subscription.items.data)
+  const quantities = deriveQuantities(subscription.items.data, logger, subscription.id)
   const periodEnd = maxCurrentPeriodEnd(subscription.items.data)
   const orgActive = subscription.status === 'active' || subscription.status === 'trialing'
   const customerId = resolveCustomerId(subscription.customer)
 
-  await sql.query(
-    `INSERT INTO subscriptions
-       (org_id, stripe_customer_id, stripe_subscription_id, status, current_period_end,
-        seats_included, seats_purchased, agent_packs, sso_enabled, updated_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now())
-     ON CONFLICT (org_id) DO UPDATE SET
-       stripe_customer_id     = excluded.stripe_customer_id,
-       stripe_subscription_id = excluded.stripe_subscription_id,
-       status                 = excluded.status,
-       current_period_end     = excluded.current_period_end,
-       seats_included         = excluded.seats_included,
-       seats_purchased        = excluded.seats_purchased,
-       agent_packs            = excluded.agent_packs,
-       sso_enabled            = excluded.sso_enabled,
-       updated_at             = now()`,
-    [
-      orgId, customerId, subscription.id, subscription.status, periodEnd,
-      seatsIncluded, seatsPurchased, agentPacks, ssoEnabled,
-    ],
-  )
+  if (quantities.tier === 'none') {
+    // Deliberately does NOT touch seats_included/seats_purchased/agent_packs/sso_enabled on an
+    // existing row (see deriveQuantities' logged warning above). A subscription with no lookup
+    // key this hub recognizes is a data quirk — catalogue drift, a lookup_key typo, or a price
+    // created outside this task's ten keys — not evidence the org bought nothing. Overwriting
+    // real cached entitlements with zeros here would silently lock a paying org out of its own
+    // board on the next routine resync of an otherwise-healthy subscription; a wrong suspension
+    // is worse for a customer than briefly stale (but still correct) cached quantities. A
+    // brand-new row (never synced before) has nothing to preserve, so it gets the schema's
+    // conservative defaults (0/false) — there is genuinely no signal yet for this org.
+    await sql.query(
+      `INSERT INTO subscriptions (org_id, stripe_customer_id, stripe_subscription_id, status, current_period_end, tier, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, now())
+       ON CONFLICT (org_id) DO UPDATE SET
+         stripe_customer_id     = excluded.stripe_customer_id,
+         stripe_subscription_id = excluded.stripe_subscription_id,
+         status                 = excluded.status,
+         current_period_end     = excluded.current_period_end,
+         tier                   = excluded.tier,
+         updated_at             = now()`,
+      [orgId, customerId, subscription.id, subscription.status, periodEnd, quantities.tier],
+    )
+  } else {
+    await sql.query(
+      `INSERT INTO subscriptions
+         (org_id, stripe_customer_id, stripe_subscription_id, status, current_period_end, tier,
+          seats_included, seats_purchased, agent_packs, sso_enabled, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now())
+       ON CONFLICT (org_id) DO UPDATE SET
+         stripe_customer_id     = excluded.stripe_customer_id,
+         stripe_subscription_id = excluded.stripe_subscription_id,
+         status                 = excluded.status,
+         current_period_end     = excluded.current_period_end,
+         tier                   = excluded.tier,
+         seats_included         = excluded.seats_included,
+         seats_purchased        = excluded.seats_purchased,
+         agent_packs            = excluded.agent_packs,
+         sso_enabled            = excluded.sso_enabled,
+         updated_at             = now()`,
+      [
+        orgId, customerId, subscription.id, subscription.status, periodEnd, quantities.tier,
+        quantities.seatsIncluded, quantities.seatsPurchased, quantities.agentPacks, quantities.ssoEnabled,
+      ],
+    )
+  }
 
   await sql.query('UPDATE orgs SET status = $1 WHERE id = $2', [orgActive ? 'active' : 'suspended', orgId])
 }
@@ -257,30 +300,57 @@ function resolveCustomerId(customer: string | { id: string }): string {
 }
 
 interface DerivedQuantities {
+  tier: SubscriptionTier
   seatsIncluded: number
   seatsPurchased: number
   agentPacks: number
   ssoEnabled: boolean
 }
 
+/** The four Cloud-track lookup keys (`cloud_base` is its own case below, but still belongs to
+ * this family for tier-detection purposes). */
+const CLOUD_LOOKUP_KEYS = new Set([
+  'cloud_base_monthly', 'cloud_base_yearly',
+  'cloud_seat_monthly', 'cloud_seat_yearly',
+  'cloud_agent_pack_monthly', 'cloud_agent_pack_yearly',
+  'cloud_sso_monthly', 'cloud_sso_yearly',
+])
+const BUSINESS_LOOKUP_KEYS = new Set(['business_seat_monthly', 'business_seat_yearly'])
+
 /**
  * The Cloud track's base line (`cloud_base_*`) always grants a fixed 3 included seats — it is
  * not a per-unit quantity. The Business track (`business_seat_*`) has no separate base line at
  * all (a 10-seat minimum is enforced by Stripe's price, not modeled here); every Business seat
  * purchased is, functionally, just another seat, so it folds into `seatsPurchased` alongside
- * `cloud_seat_*` rather than needing its own cached column. This is a scope decision the brief
- * left ambiguous — see the task report.
+ * `cloud_seat_*`. Tier identity is tracked SEPARATELY (`tier`), specifically so Task 6 never has
+ * to reconstruct it from `seats_included === 0` — that heuristic is ambiguous between a
+ * legitimate Business org and a Cloud checkout missing its base line.
+ *
+ * Two deliberately-handled edge cases:
+ *   - Both families present on one subscription (checkout doesn't prevent selling a
+ *     `business_seat_*` line to an org that already has `cloud_base_*`, or vice versa via two
+ *     separate checkouts over time): resolved to `'cloud'` — a subscription with a `cloud_base`
+ *     line is unambiguously Cloud regardless of what else got attached — and logged loudly, since
+ *     this should never happen from this hub's own checkout flow and signals either a manual
+ *     Stripe dashboard edit or a bug upstream of this function.
+ *   - Neither family present (no item's lookup key matches any of the ten this task defines):
+ *     resolved to `'none'`. The caller (`syncSubscriptionFromStripe`) does NOT overwrite
+ *     previously cached seat/pack/SSO numbers in this case — see its own comment.
  */
-function deriveQuantities(items: StripeSubscriptionItemLike[]): DerivedQuantities {
+function deriveQuantities(items: StripeSubscriptionItemLike[], logger: SyncLogger, subscriptionId: string): DerivedQuantities {
   let seatsIncluded = 0
   let seatsPurchased = 0
   let agentPacks = 0
   let ssoEnabled = false
+  let cloudPresent = false
+  let businessPresent = false
 
   for (const item of items) {
     const key = item.price?.lookup_key
     if (!key) continue
     const quantity = item.quantity ?? 0
+    if (CLOUD_LOOKUP_KEYS.has(key)) cloudPresent = true
+    if (BUSINESS_LOOKUP_KEYS.has(key)) businessPresent = true
 
     switch (key) {
       case 'cloud_base_monthly':
@@ -309,7 +379,26 @@ function deriveQuantities(items: StripeSubscriptionItemLike[]): DerivedQuantitie
     }
   }
 
-  return { seatsIncluded, seatsPurchased, agentPacks, ssoEnabled }
+  let tier: SubscriptionTier
+  if (cloudPresent && businessPresent) {
+    tier = 'cloud'
+    logger.warn(
+      'stripe subscription has both Cloud and Business lookup keys; resolving to Cloud tier deterministically',
+      { subscriptionId },
+    )
+  } else if (cloudPresent) {
+    tier = 'cloud'
+  } else if (businessPresent) {
+    tier = 'business'
+  } else {
+    tier = 'none'
+    logger.warn(
+      'stripe subscription has no recognized Cloud or Business lookup key; leaving cached entitlement quantities unchanged',
+      { subscriptionId },
+    )
+  }
+
+  return { tier, seatsIncluded, seatsPurchased, agentPacks, ssoEnabled }
 }
 
 /** Stripe items on one subscription normally share a billing cycle, so their

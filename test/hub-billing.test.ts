@@ -1,6 +1,9 @@
-import { describe, it, expect, vi } from 'vitest'
-import { createCheckoutSession, createPortalSession, syncSubscriptionFromStripe, type StripeBillingClient, type StripeSubscriptionLike } from '../src/hub/billing.js'
+import { describe, it, expect, vi, afterEach } from 'vitest'
+import type { FastifyInstance } from 'fastify'
+import { createCheckoutSession, createPortalSession, syncSubscriptionFromStripe, type StripeBillingClient, type StripeSubscriptionLike, type SyncLogger } from '../src/hub/billing.js'
 import { ValidationError } from '../src/hub/errors.js'
+import { buildHubServer } from '../src/hub/server.js'
+import { mintDeviceToken } from '../src/hub/devices.js'
 import { hubTestSql, seedOrg } from './support/hub-sql.js'
 
 /** A `StripeBillingClient` mock — every method a `vi.fn()`, so a test can both control what
@@ -324,5 +327,254 @@ describe('syncSubscriptionFromStripe', () => {
 
     const row = (await sql.query('SELECT seats_included, seats_purchased FROM subscriptions WHERE org_id = $1', ['org_a'])).rows[0]
     expect(row).toMatchObject({ seats_included: 0, seats_purchased: 10 })
+  })
+
+  describe('tier', () => {
+    it('a Cloud-only subscription is tier "cloud"', async () => {
+      const sql = await hubTestSql()
+      await seedOrg(sql, 'org_a')
+
+      await syncSubscriptionFromStripe(sql, subscription({
+        metadata: { orgId: 'org_a' },
+        items: { data: [item('cloud_base_monthly', 1), item('cloud_seat_monthly', 2)] },
+      }))
+
+      const row = (await sql.query('SELECT tier FROM subscriptions WHERE org_id = $1', ['org_a'])).rows[0]
+      expect(row.tier).toBe('cloud')
+    })
+
+    it('a Business-only subscription is tier "business"', async () => {
+      const sql = await hubTestSql()
+      await seedOrg(sql, 'org_a')
+
+      await syncSubscriptionFromStripe(sql, subscription({
+        metadata: { orgId: 'org_a' },
+        items: { data: [item('business_seat_monthly', 10)] },
+      }))
+
+      const row = (await sql.query('SELECT tier FROM subscriptions WHERE org_id = $1', ['org_a'])).rows[0]
+      expect(row.tier).toBe('business')
+    })
+
+    it('a subscription mixing Cloud and Business lookup keys resolves to "cloud" deterministically and logs loudly', async () => {
+      const sql = await hubTestSql()
+      await seedOrg(sql, 'org_a')
+      const logger: SyncLogger = { warn: vi.fn() }
+
+      await syncSubscriptionFromStripe(sql, subscription({
+        id: 'sub_mixed', metadata: { orgId: 'org_a' },
+        items: { data: [item('cloud_base_monthly', 1), item('business_seat_monthly', 5)] },
+      }), logger)
+
+      const row = (await sql.query('SELECT tier FROM subscriptions WHERE org_id = $1', ['org_a'])).rows[0]
+      expect(row.tier).toBe('cloud')
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.stringMatching(/both Cloud and Business/i),
+        expect.objectContaining({ subscriptionId: 'sub_mixed' }),
+      )
+    })
+
+    it('mixing families is deterministic regardless of item order', async () => {
+      const sql = await hubTestSql()
+      await seedOrg(sql, 'org_a')
+
+      // Same mix, business line listed first this time.
+      await syncSubscriptionFromStripe(sql, subscription({
+        metadata: { orgId: 'org_a' },
+        items: { data: [item('business_seat_monthly', 5), item('cloud_base_monthly', 1)] },
+      }))
+
+      const row = (await sql.query('SELECT tier FROM subscriptions WHERE org_id = $1', ['org_a'])).rows[0]
+      expect(row.tier).toBe('cloud')
+    })
+
+    it('no recognized lookup key at all is tier "none", logs loudly, and a brand-new row gets conservative (zero) defaults', async () => {
+      const sql = await hubTestSql()
+      await seedOrg(sql, 'org_a')
+      const logger: SyncLogger = { warn: vi.fn() }
+
+      await syncSubscriptionFromStripe(sql, subscription({
+        id: 'sub_unknown', metadata: { orgId: 'org_a' },
+        items: { data: [item('some_price_not_in_our_catalogue', 1)] },
+      }), logger)
+
+      const row = (await sql.query(
+        'SELECT tier, seats_included, seats_purchased, agent_packs, sso_enabled FROM subscriptions WHERE org_id = $1', ['org_a'],
+      )).rows[0]
+      expect(row).toMatchObject({ tier: 'none', seats_included: 0, seats_purchased: 0, agent_packs: 0, sso_enabled: false })
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.stringMatching(/no recognized Cloud or Business lookup key/i),
+        expect.objectContaining({ subscriptionId: 'sub_unknown' }),
+      )
+    })
+
+    it('a resync with no recognized lookup key does NOT clobber previously cached entitlements — a data quirk never locks a paying org out', async () => {
+      const sql = await hubTestSql()
+      await seedOrg(sql, 'org_a')
+
+      // A healthy prior sync established real cached entitlements.
+      await syncSubscriptionFromStripe(sql, subscription({
+        id: 'sub_healthy', metadata: { orgId: 'org_a' },
+        items: { data: [item('cloud_base_monthly', 1), item('cloud_seat_monthly', 4), item('cloud_agent_pack_monthly', 2)] },
+      }))
+      const before = (await sql.query(
+        'SELECT tier, seats_included, seats_purchased, agent_packs FROM subscriptions WHERE org_id = $1', ['org_a'],
+      )).rows[0]
+      expect(before).toMatchObject({ tier: 'cloud', seats_included: 3, seats_purchased: 4, agent_packs: 2 })
+
+      // A later resync of the SAME subscription somehow carries no recognized lookup key (e.g.
+      // a dashboard edit swapped in an ad-hoc price) — status/period still update, but the real
+      // cached seat/pack numbers must survive untouched rather than being zeroed out.
+      await syncSubscriptionFromStripe(sql, subscription({
+        id: 'sub_healthy', status: 'active', metadata: { orgId: 'org_a' },
+        items: { data: [item('some_unrelated_price', 1)] },
+      }))
+
+      const after = (await sql.query(
+        'SELECT tier, seats_included, seats_purchased, agent_packs FROM subscriptions WHERE org_id = $1', ['org_a'],
+      )).rows[0]
+      expect(after).toMatchObject({ tier: 'none', seats_included: 3, seats_purchased: 4, agent_packs: 2 })
+    })
+
+    it('the org active/suspended mapping is unaffected by tier "none" — it still tracks subscription.status', async () => {
+      const sql = await hubTestSql()
+      await seedOrg(sql, 'org_a')
+      await sql.query('UPDATE orgs SET status = $1 WHERE id = $2', ['suspended', 'org_a'])
+
+      await syncSubscriptionFromStripe(sql, subscription({
+        metadata: { orgId: 'org_a' }, status: 'active',
+        items: { data: [item('unrecognized_price', 1)] },
+      }))
+
+      const org = (await sql.query('SELECT status FROM orgs WHERE id = $1', ['org_a'])).rows[0]
+      expect(org.status).toBe('active')
+    })
+
+    it('defaults to console.warn when no logger is injected (does not throw)', async () => {
+      const sql = await hubTestSql()
+      await seedOrg(sql, 'org_a')
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+      await expect(syncSubscriptionFromStripe(sql, subscription({
+        metadata: { orgId: 'org_a' },
+        items: { data: [item('unrecognized_price', 1)] },
+      }))).resolves.toBeUndefined()
+
+      expect(warnSpy).toHaveBeenCalled()
+      warnSpy.mockRestore()
+    })
+  })
+})
+
+describe('billing HTTP routes', () => {
+  const servers: FastifyInstance[] = []
+  afterEach(async () => {
+    for (const server of servers.splice(0)) await server.close()
+  })
+
+  async function buildServer(sql: Awaited<ReturnType<typeof hubTestSql>>, stripe: ReturnType<typeof mockStripe> | undefined) {
+    const server = buildHubServer(sql as any, stripe ? { stripeClient: stripe } : {})
+    servers.push(server)
+    await server.ready()
+    return server
+  }
+
+  it('checkout happy path returns the Stripe-provided url', async () => {
+    const sql = await hubTestSql()
+    await seedOrg(sql, 'org_a')
+    const { token } = await mintDeviceToken(sql, { orgId: 'org_a', name: 'laptop' })
+    const stripe = mockStripe()
+    const server = await buildServer(sql, stripe)
+
+    const response = await server.inject({
+      method: 'POST', url: '/api/v1/hub/orgs/org_a/billing/checkout',
+      headers: { authorization: `Bearer ${token}` },
+      payload: { lookup_key: 'cloud_base_monthly', quantity: 1 },
+    })
+
+    expect(response.statusCode).toBe(200)
+    expect(response.json()).toEqual({ url: 'https://checkout.stripe.com/session_abc' })
+  })
+
+  it('portal happy path returns the Stripe-provided url when the org has a customer on file', async () => {
+    const sql = await hubTestSql()
+    await seedOrg(sql, 'org_a')
+    await sql.query(`INSERT INTO subscriptions (org_id, stripe_customer_id, status) VALUES ($1, $2, 'active')`, ['org_a', 'cus_route_test'])
+    const { token } = await mintDeviceToken(sql, { orgId: 'org_a', name: 'laptop' })
+    const stripe = mockStripe()
+    const server = await buildServer(sql, stripe)
+
+    const response = await server.inject({
+      method: 'POST', url: '/api/v1/hub/orgs/org_a/billing/portal',
+      headers: { authorization: `Bearer ${token}` },
+    })
+
+    expect(response.statusCode).toBe(200)
+    expect(response.json()).toEqual({ url: 'https://billing.stripe.com/portal_abc' })
+    expect(stripe.billingPortal.sessions.create).toHaveBeenCalledWith(expect.objectContaining({ customer: 'cus_route_test' }))
+  })
+
+  it('an unknown lookup key at the HTTP layer is a 400, not a 500', async () => {
+    const sql = await hubTestSql()
+    await seedOrg(sql, 'org_a')
+    const { token } = await mintDeviceToken(sql, { orgId: 'org_a', name: 'laptop' })
+    const stripe = mockStripe()
+    const server = await buildServer(sql, stripe)
+
+    const response = await server.inject({
+      method: 'POST', url: '/api/v1/hub/orgs/org_a/billing/checkout',
+      headers: { authorization: `Bearer ${token}` },
+      payload: { lookup_key: 'not_a_real_key' },
+    })
+
+    expect(response.statusCode).toBe(400)
+    expect(stripe.checkout.sessions.create).not.toHaveBeenCalled()
+  })
+
+  it('a device token scoped to a different org is refused 403 before the handler runs', async () => {
+    const sql = await hubTestSql()
+    await seedOrg(sql, 'org_a')
+    await seedOrg(sql, 'org_b')
+    // Token is scoped to org_b, but the URL asks for org_a's billing.
+    const { token } = await mintDeviceToken(sql, { orgId: 'org_b', name: 'laptop' })
+    const stripe = mockStripe()
+    const server = await buildServer(sql, stripe)
+
+    const checkoutResponse = await server.inject({
+      method: 'POST', url: '/api/v1/hub/orgs/org_a/billing/checkout',
+      headers: { authorization: `Bearer ${token}` },
+      payload: { lookup_key: 'cloud_base_monthly' },
+    })
+    const portalResponse = await server.inject({
+      method: 'POST', url: '/api/v1/hub/orgs/org_a/billing/portal',
+      headers: { authorization: `Bearer ${token}` },
+    })
+
+    expect(checkoutResponse.statusCode).toBe(403)
+    expect(portalResponse.statusCode).toBe(403)
+    expect(stripe.checkout.sessions.create).not.toHaveBeenCalled()
+    expect(stripe.billingPortal.sessions.create).not.toHaveBeenCalled()
+  })
+
+  it('checkout and portal both 500 with a clear body when Stripe is not configured', async () => {
+    const sql = await hubTestSql()
+    await seedOrg(sql, 'org_a')
+    const { token } = await mintDeviceToken(sql, { orgId: 'org_a', name: 'laptop' })
+    const server = await buildServer(sql, undefined)
+
+    const checkoutResponse = await server.inject({
+      method: 'POST', url: '/api/v1/hub/orgs/org_a/billing/checkout',
+      headers: { authorization: `Bearer ${token}` },
+      payload: { lookup_key: 'cloud_base_monthly' },
+    })
+    const portalResponse = await server.inject({
+      method: 'POST', url: '/api/v1/hub/orgs/org_a/billing/portal',
+      headers: { authorization: `Bearer ${token}` },
+    })
+
+    expect(checkoutResponse.statusCode).toBe(500)
+    expect(checkoutResponse.json()).toMatchObject({ code: 'internal_error' })
+    expect(portalResponse.statusCode).toBe(500)
+    expect(portalResponse.json()).toMatchObject({ code: 'internal_error' })
   })
 })

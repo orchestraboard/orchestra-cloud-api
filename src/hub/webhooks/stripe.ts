@@ -1,5 +1,5 @@
 import type { FastifyPluginAsync, FastifyRequest } from 'fastify'
-import { syncSubscriptionFromStripe, type StripeSubscriptionLike } from '../billing.js'
+import { syncSubscriptionFromStripe, type StripeSubscriptionLike, type SyncLogger } from '../billing.js'
 import type { HubSqlPool } from '../sql.js'
 
 export interface HubStripeWebhookEnv {
@@ -97,6 +97,12 @@ export const hubStripeWebhookPlugin: FastifyPluginAsync<HubStripeWebhookPluginOp
 async function applyStripeEvent(
   sql: HubSqlPool, stripe: StripeWebhookClient, event: StripeEventLike, request: FastifyRequest,
 ): Promise<void> {
+  // Adapts Fastify's request-scoped pino logger (`.warn(mergingObject, msg)`) to the plain
+  // `.warn(message, meta)` shape `syncSubscriptionFromStripe` expects — so its mixed-tier /
+  // unrecognized-lookup-key warnings land in the same structured, request-scoped logs as
+  // everything else this request logs, rather than falling back to bare `console.warn`.
+  const logger: SyncLogger = { warn: (message, meta) => request.log.warn(meta ?? {}, message) }
+
   switch (event.type) {
     case 'checkout.session.completed': {
       const session = event.data.object as { subscription?: string | null }
@@ -110,7 +116,7 @@ async function applyStripeEvent(
       const subscription = await stripe.subscriptions.retrieve(session.subscription, {
         expand: ['items.data.price'],
       })
-      await syncSubscriptionFromStripe(sql, subscription)
+      await syncSubscriptionFromStripe(sql, subscription, logger)
       return
     }
     case 'customer.subscription.updated':
@@ -121,7 +127,7 @@ async function applyStripeEvent(
       // suspend the org: there's no separate "deleted" branch, the shared status mapping
       // already handles it.
       const subscription = event.data.object as StripeSubscriptionLike
-      await syncSubscriptionFromStripe(sql, subscription)
+      await syncSubscriptionFromStripe(sql, subscription, logger)
       return
     }
     default:
