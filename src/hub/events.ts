@@ -38,6 +38,16 @@ export interface AppendOrgEvent {
  * reusing a burned number — that would let a replayed/retried append collide
  * with an unrelated already-delivered event at the same seq, which WOULD
  * break resume.
+ *
+ * Concurrent-replay race: two callers with the same idempotency key can both
+ * pass the pre-check above before either has committed, and both attempt the
+ * INSERT. `org_events_idempotency_idx` (a UNIQUE index on (org_id,
+ * idempotency_key), migration 003) then rejects the loser with Postgres
+ * SQLSTATE 23505. Rather than let that surface as a raw DB error, the loser
+ * re-reads the row the winner just committed and returns it — the winner
+ * already appended exactly the event this caller wanted, so returning it IS
+ * the correct idempotent answer, not an error. Only a kind mismatch (or,
+ * defensively, no row found at all) still throws.
  */
 export async function appendOrgEvent(tx: HubSql, input: AppendOrgEvent): Promise<HubEvent> {
   const key = input.idempotencyKey ?? null
@@ -62,17 +72,50 @@ export async function appendOrgEvent(tx: HubSql, input: AppendOrgEvent): Promise
   )
   const seq = Number(allocated.rows[0]?.next_seq)
 
-  const inserted = await tx.query<HubEvent>(
-    `INSERT INTO org_events (id, org_id, seq, kind, board_id, actor_device_id, idempotency_key, payload)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-     RETURNING *`,
-    [
-      `evt_${randomUUID()}`, input.orgId, seq, input.kind,
-      input.boardId ?? null, input.actorDeviceId ?? null, key,
-      JSON.stringify(input.payload ?? {}),
-    ],
-  )
-  return normalize(inserted.rows[0])
+  try {
+    const inserted = await tx.query<HubEvent>(
+      `INSERT INTO org_events (id, org_id, seq, kind, board_id, actor_device_id, idempotency_key, payload)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       RETURNING *`,
+      [
+        `evt_${randomUUID()}`, input.orgId, seq, input.kind,
+        input.boardId ?? null, input.actorDeviceId ?? null, key,
+        JSON.stringify(input.payload ?? {}),
+      ],
+    )
+    return normalize(inserted.rows[0])
+  } catch (error) {
+    if (!key || !isIdempotencyUniqueViolation(error)) throw error
+    const winner = await tx.query<HubEvent>(
+      'SELECT * FROM org_events WHERE org_id = $1 AND idempotency_key = $2',
+      [input.orgId, key],
+    )
+    const prior = winner.rows[0]
+    if (!prior) throw error
+    if (prior.kind !== input.kind) {
+      throw new ConflictError('idempotency key was already used for a different event')
+    }
+    return normalize(prior)
+  }
+}
+
+/**
+ * Detects a unique-violation on `org_events_idempotency_idx` defensively: real
+ * Postgres and PGlite both surface SQLSTATE `23505` as `error.code` (verified against
+ * PGlite directly — same wire-protocol error fields node-postgres exposes), so that is
+ * the primary check. The constraint-name / message match is a fallback in case either
+ * driver ever shapes the error differently for this index specifically.
+ */
+function isIdempotencyUniqueViolation(error: unknown): boolean {
+  const err = error as { code?: string; constraint?: string; message?: string } | undefined
+  if (!err) return false
+  // `org_events` has one other unique constraint, UNIQUE(org_id, seq) — also SQLSTATE
+  // 23505 but a different bug entirely (the seq counter, not idempotency). When the
+  // driver gives us a constraint name, require it name this index specifically so we
+  // never mistake that unrelated violation for a replay race.
+  if (err.constraint) return err.constraint.includes('idempotency')
+  if (err.code !== '23505') return false
+  return `${err.message ?? ''}`.toLowerCase().includes('org_events_idempotency_idx')
 }
 
 /**

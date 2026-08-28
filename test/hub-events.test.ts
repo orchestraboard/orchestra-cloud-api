@@ -1,6 +1,30 @@
 import { describe, it, expect } from 'vitest'
 import { appendOrgEvent, readOrgEventsSince, latestOrgSeq } from '../src/hub/events.js'
 import { hubTestSql, seedOrg } from './support/hub-sql.js'
+import type { HubSql } from '../src/hub/sql.js'
+
+/**
+ * PGlite is single-connection, so there is no way to truly interleave two live
+ * transactions in a test. This wraps a real `HubSql` and, at the moment the caller
+ * under test is about to run its `INSERT INTO org_events`, first commits a "winner"
+ * row directly (standing in for a concurrent caller that got there first) and then
+ * lets the real INSERT proceed — which then hits the genuine partial unique index
+ * (`org_events_idempotency_idx`) and throws the real Postgres-shaped 23505 error.
+ * That exercises `appendOrgEvent`'s actual recovery path against a real error object,
+ * not a fabricated one — only the "two writers at once" part is simulated.
+ */
+function raceInjectingSql(real: HubSql, injectWinner: () => Promise<void>): HubSql {
+  let injected = false
+  return {
+    query: async (text, params) => {
+      if (!injected && text.includes('INSERT INTO org_events (id')) {
+        injected = true
+        await injectWinner()
+      }
+      return real.query(text, params)
+    },
+  }
+}
 
 describe('org event log', () => {
   it('assigns a gapless monotonic seq per org', async () => {
@@ -94,5 +118,47 @@ describe('org event log', () => {
     const next = await appendOrgEvent(sql, { orgId: 'org_a', kind: 'card.created', payload: { n: 1 } })
     expect(next.seq).toBe(2)
     expect(await latestOrgSeq(sql, 'org_a')).toBe(2)
+  })
+
+  it('returns the winning event, not an error, when two writers race the same key', async () => {
+    const sql = await hubTestSql()
+    await seedOrg(sql, 'org_a')
+
+    const raced = raceInjectingSql(sql, async () => {
+      await sql.query(
+        `INSERT INTO org_events (id, org_id, seq, kind, idempotency_key, payload)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        ['evt_winner', 'org_a', 99999, 'card.created', 'race-key', JSON.stringify({ winner: true })],
+      )
+    })
+
+    const loser = await appendOrgEvent(raced, {
+      orgId: 'org_a', kind: 'card.created', idempotencyKey: 'race-key', payload: { winner: false },
+    })
+
+    // The loser gets the winner's event back, not its own — that IS the winner's event.
+    expect(loser.id).toBe('evt_winner')
+    expect((loser.payload as any).winner).toBe(true)
+
+    // No orphan/duplicate row: only the winner's event exists for this key.
+    const all = await readOrgEventsSince(sql, 'org_a', 0)
+    expect(all.filter((e) => e.id === 'evt_winner')).toHaveLength(1)
+  })
+
+  it('rejects the race when the winning event is a different kind', async () => {
+    const sql = await hubTestSql()
+    await seedOrg(sql, 'org_a')
+
+    const raced = raceInjectingSql(sql, async () => {
+      await sql.query(
+        `INSERT INTO org_events (id, org_id, seq, kind, idempotency_key, payload)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        ['evt_winner_2', 'org_a', 99999, 'card.updated', 'race-key-2', JSON.stringify({ winner: true })],
+      )
+    })
+
+    await expect(appendOrgEvent(raced, {
+      orgId: 'org_a', kind: 'card.created', idempotencyKey: 'race-key-2', payload: { winner: false },
+    })).rejects.toMatchObject({ statusCode: 409 })
   })
 })

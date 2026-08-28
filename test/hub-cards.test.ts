@@ -141,6 +141,23 @@ describe('hub card ops', () => {
     expect(events.filter((e) => e.kind === 'card.moved').length).toBe(1)
   })
 
+  it('refuses to reuse an idempotency key across a different kind of operation', async () => {
+    const sql = await board()
+    const card = await createCard(sql, {
+      orgId: 'org_a', boardId: 'board_1', title: 'Reused key', idempotencyKey: 'shared-key',
+    })
+
+    await expect(
+      claimCard(sql, { orgId: 'org_a', cardId: card.id, agent: 'agent-one', idempotencyKey: 'shared-key' }),
+    ).rejects.toMatchObject({ statusCode: 409 })
+
+    const fresh = await getCard(sql, 'org_a', card.id)
+    expect(fresh?.owner_agent).toBeNull() // the claim did not land
+
+    const events = await readOrgEventsSince(sql, 'org_a', 0)
+    expect(events.length).toBe(1) // only the original card.created event
+  })
+
   it('refuses to read or write another org\'s card', async () => {
     const sql = await board()
     await seedOrg(sql, 'org_b')

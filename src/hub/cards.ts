@@ -3,7 +3,7 @@ import { appendOrgEvent, findOrgEventByIdempotencyKey } from './events.js'
 import { ConflictError, NotFoundError, ValidationError } from './errors.js'
 import { withTransaction, type HubSql, type HubSqlPool } from './sql.js'
 import { boundedString, optionalBoundedString, positiveInteger, stringList } from './validate.js'
-import type { HubCard } from './types.js'
+import type { HubCard, HubEventKind } from './types.js'
 
 const CARD_COLUMNS = new Set(['backlog', 'todo', 'in_progress', 'review', 'done'])
 
@@ -40,7 +40,7 @@ export async function createCard(sql: HubSqlPool, input: CreateCardInput): Promi
   const paths = stringList(input.paths, 'paths', 50, 400)
 
   return withTransaction(sql, async (tx) => {
-    const replay = await replayIfIdempotent(tx, input.orgId, input.idempotencyKey)
+    const replay = await replayIfIdempotent(tx, input.orgId, input.idempotencyKey, 'card.created')
     if (replay) return replay
 
     const board = await tx.query('SELECT id FROM boards WHERE org_id = $1 AND id = $2', [input.orgId, input.boardId])
@@ -73,7 +73,7 @@ export async function updateCard(sql: HubSqlPool, input: UpdateCardInput): Promi
   const paths = input.paths === undefined ? undefined : stringList(input.paths, 'paths', 50, 400)
 
   return withTransaction(sql, async (tx) => {
-    const replay = await replayIfIdempotent(tx, input.orgId, input.idempotencyKey)
+    const replay = await replayIfIdempotent(tx, input.orgId, input.idempotencyKey, 'card.updated')
     if (replay) return replay
 
     const updated = await tx.query<any>(
@@ -107,7 +107,7 @@ export async function moveCard(sql: HubSqlPool, input: MoveCardInput): Promise<H
   }
 
   return withTransaction(sql, async (tx) => {
-    const replay = await replayIfIdempotent(tx, input.orgId, input.idempotencyKey)
+    const replay = await replayIfIdempotent(tx, input.orgId, input.idempotencyKey, 'card.moved')
     if (replay) return replay
 
     const updated = await tx.query<any>(
@@ -136,7 +136,7 @@ export async function claimCard(sql: HubSqlPool, input: ClaimCardInput): Promise
   const agent = boundedString(input.agent, 'agent', 120)
 
   return withTransaction(sql, async (tx) => {
-    const replay = await replayIfIdempotent(tx, input.orgId, input.idempotencyKey)
+    const replay = await replayIfIdempotent(tx, input.orgId, input.idempotencyKey, 'card.claimed')
     if (replay) return replay
 
     const claimed = await tx.query<any>(
@@ -168,16 +168,26 @@ export async function claimCard(sql: HubSqlPool, input: ClaimCardInput): Promise
  * whether its first attempt actually committed. We return the entity exactly as the
  * original call left it (the event's stored payload) and perform no mutation at all,
  * so a replay never double-applies, never bumps `version` twice, and never appends a
- * second event. `appendOrgEvent`'s own "same key, different payload" ConflictError
- * stays in place as a backstop for the race window where two concurrent calls with
- * the same key both pass this check before either has committed its event.
+ * second event.
+ *
+ * A prior event under the same key but a DIFFERENT kind is not a replay — it's a key
+ * collision (e.g. a client bug that reuses one key across a `createCard` and a later
+ * `claimCard`). That must fail loudly rather than silently hand back the wrong op's
+ * result, so it throws `ConflictError` instead of returning. `appendOrgEvent`'s own
+ * "same key, different payload/kind" check stays in place as a backstop for the race
+ * window where two concurrent calls with the same key both pass this check before
+ * either has committed its event.
  */
 async function replayIfIdempotent(
-  tx: HubSql, orgId: string, idempotencyKey: string | null | undefined,
+  tx: HubSql, orgId: string, idempotencyKey: string | null | undefined, expectedKind: HubEventKind,
 ): Promise<HubCard | null> {
   if (!idempotencyKey) return null
   const prior = await findOrgEventByIdempotencyKey(tx, orgId, idempotencyKey)
-  return prior ? (prior.payload as HubCard) : null
+  if (!prior) return null
+  if (prior.kind !== expectedKind) {
+    throw new ConflictError('idempotency key was already used for a different operation')
+  }
+  return prior.payload as HubCard
 }
 
 /** Zero rows updated means either the card is gone or someone else moved first. */
