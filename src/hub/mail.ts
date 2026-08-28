@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import { appendOrgEvent, replayIfIdempotent } from './events.js'
 import { NotFoundError } from './errors.js'
+import { requireOrgEntity } from './scope.js'
 import { withTransaction, type HubSql, type HubSqlPool } from './sql.js'
 import { boundedString, optionalBoundedString } from './validate.js'
 import type { HubMail } from './types.js'
@@ -31,6 +32,12 @@ export async function sendMail(sql: HubSqlPool, input: SendMailInput): Promise<H
 
     const board = await tx.query('SELECT id FROM boards WHERE org_id = $1 AND id = $2', [input.orgId, input.boardId])
     if (!board.rows[0]) throw new NotFoundError('board not found in this org')
+
+    // `card_id` and `reply_to` are client-supplied foreign keys. Both are checked
+    // against this org, in this transaction, so neither can write a reference to
+    // another tenant's row or reveal whether one exists (see scope.ts).
+    await requireOrgEntity(tx, input.orgId, 'card', input.cardId)
+    await requireOrgEntity(tx, input.orgId, 'mail', input.replyTo)
 
     const inserted = await tx.query<HubMail>(
       `INSERT INTO mail (id, org_id, board_id, card_id, kind, subject, body, from_agent, to_agent, to_human, reply_to)

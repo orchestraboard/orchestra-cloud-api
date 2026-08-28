@@ -1,11 +1,26 @@
 import { randomUUID } from 'node:crypto'
 import { appendOrgEvent } from './events.js'
-import { NotFoundError } from './errors.js'
+import { NotFoundError, ValidationError } from './errors.js'
+import { requireOrgEntity } from './scope.js'
 import { withTransaction, type HubSql, type HubSqlPool } from './sql.js'
 import { boundedString, optionalBoundedString } from './validate.js'
 import type { HubAgent, HubAgentState } from './types.js'
 
 const DEFAULT_TTL_SECONDS = 45
+
+/**
+ * The `HubAgentState` union, at runtime. Mirrors the CHECK constraint on
+ * `agents.state` in migration 002 — a value that passes here must pass there, or a
+ * client's bad input surfaces as a 500 from the database instead of a 400 from us.
+ */
+const AGENT_STATES = new Set<string>(['working', 'idle', 'waiting', 'offline'])
+
+export function agentState(value: unknown): HubAgentState {
+  if (typeof value !== 'string' || !AGENT_STATES.has(value)) {
+    throw new ValidationError(`state must be one of ${[...AGENT_STATES].join(', ')}`)
+  }
+  return value as HubAgentState
+}
 
 export interface RegisterAgentInput {
   orgId: string; boardId: string; name: string; deviceId?: string | null
@@ -49,15 +64,24 @@ export async function registerAgent(sql: HubSqlPool, input: RegisterAgentInput):
  * a heartbeat every 15s per agent would swamp the replayable log for no benefit.
  * Live viewers get presence from the SSE presence frame instead.
  */
-export async function heartbeat(sql: HubSql, input: HeartbeatInput): Promise<HubAgent> {
+export async function heartbeat(sql: HubSqlPool, input: HeartbeatInput): Promise<HubAgent> {
   const activity = optionalBoundedString(input.activity, 'activity', 200) ?? null
-  const result = await sql.query<HubAgent>(
-    `UPDATE agents SET state = $3, current_card_id = $4, activity = $5, last_heartbeat_at = now()
-     WHERE org_id = $1 AND id = $2 RETURNING *`,
-    [input.orgId, input.agentId, input.state, input.currentCardId ?? null, activity],
-  )
-  if (!result.rows[0]) throw new NotFoundError('agent not found in this org')
-  return normalize(result.rows[0])
+  const state = agentState(input.state)
+
+  // `current_card_id` is a client-supplied foreign key. It is checked against this
+  // org, in the same transaction as the UPDATE, so a card from another tenant is a
+  // 404 rather than a silently written cross-tenant reference (see scope.ts).
+  return withTransaction(sql, async (tx) => {
+    await requireOrgEntity(tx, input.orgId, 'card', input.currentCardId)
+
+    const result = await tx.query<HubAgent>(
+      `UPDATE agents SET state = $3, current_card_id = $4, activity = $5, last_heartbeat_at = now()
+       WHERE org_id = $1 AND id = $2 RETURNING *`,
+      [input.orgId, input.agentId, state, input.currentCardId ?? null, activity],
+    )
+    if (!result.rows[0]) throw new NotFoundError('agent not found in this org')
+    return normalize(result.rows[0])
+  })
 }
 
 /**

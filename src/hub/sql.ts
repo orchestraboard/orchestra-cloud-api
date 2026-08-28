@@ -16,9 +16,25 @@ export interface HubSqlConnection extends HubSql {
 }
 
 /**
- * Runs `fn` inside one transaction. When the pool can hand out a dedicated
- * connection we use it (real Postgres); PGlite is single-connection and serialises
- * on its own, so the fallback issues the same statements against the shared handle.
+ * Runs `fn` inside one transaction.
+ *
+ * With a pool that can hand out a dedicated connection (real Postgres, via
+ * `createPgPool`), this is a real transaction: BEGIN/COMMIT and everything between
+ * them run on one connection that nothing else can touch, so concurrent
+ * transactions are isolated by the database.
+ *
+ * The `conn = null` fallback is NOT that. It issues BEGIN/COMMIT/ROLLBACK against
+ * a shared handle, which for the PGlite test adapter is a single connection shared
+ * by every caller. PGlite serialises each individual statement, but it does not
+ * scope a transaction to a caller: two overlapping `withTransaction` calls
+ * interleave their statements on one session, so the second BEGIN joins the first
+ * transaction and the first COMMIT commits both. A rolled-back transaction's writes
+ * can survive because a concurrent COMMIT got there before the ROLLBACK.
+ *
+ * The practical consequence, for whoever reads this next: the test harness can
+ * PASS a concurrency test that should fail. Isolation and rollback-under-contention
+ * are not observable through the fallback — a test that appears to prove them is
+ * proving nothing. Assert those against real Postgres, or not at all.
  */
 export async function withTransaction<T>(sql: HubSqlPool, fn: (tx: HubSql) => Promise<T>): Promise<T> {
   const conn = sql.connect ? await sql.connect() : null

@@ -27,7 +27,11 @@ function raceInjectingSql(real: HubSql, injectWinner: () => Promise<void>): HubS
 }
 
 describe('org event log', () => {
-  it('assigns a gapless monotonic seq per org', async () => {
+  // Deliberately not "gapless": events.ts documents that a burned seq (a crash
+  // between the counter bump and the insert) leaves a gap on purpose, and that
+  // closing the gap by reusing the number would break resume. What is guaranteed
+  // is that seq increases, and that the counter is per-org.
+  it('assigns an increasing per-org seq', async () => {
     const sql = await hubTestSql()
     await seedOrg(sql, 'org_a')
     await seedOrg(sql, 'org_b')

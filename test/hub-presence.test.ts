@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest'
 import { registerAgent, heartbeat, sweepStalePresence, listAgents } from '../src/hub/presence.js'
+import { createCard } from '../src/hub/cards.js'
 import { readOrgEventsSince } from '../src/hub/events.js'
 import { hubTestSql, seedOrg, seedBoard } from './support/hub-sql.js'
 
@@ -75,5 +76,50 @@ describe('hub presence', () => {
     const swept = await sweepStalePresence(sql, 'org_a', 45)
     expect(swept).toBe(1)
     expect((await listAgents(sql, 'org_a'))[0].state).toBe('offline')
+  })
+
+  it('rejects a state outside the union, and a missing one, with a 400', async () => {
+    const sql = await board()
+    const agent = await registerAgent(sql, { orgId: 'org_a', boardId: 'board_1', name: 'alice-agent' })
+
+    for (const state of ['not-a-real-state', undefined, null, 7, 'WORKING']) {
+      const attempt = heartbeat(sql, { orgId: 'org_a', agentId: agent.id, state: state as any })
+      await expect(attempt).rejects.toMatchObject({ statusCode: 400, code: 'validation_failed' })
+    }
+
+    // The bad heartbeats left no trace — state is still the registration default.
+    expect((await listAgents(sql, 'org_a'))[0].state).toBe('idle')
+  })
+
+  it('404s a current_card_id from another org without touching the agent', async () => {
+    const sql = await board()
+    await seedOrg(sql, 'org_b')
+    await seedBoard(sql, 'org_b', 'board_b')
+    const foreign = await createCard(sql, { orgId: 'org_b', boardId: 'board_b', title: 'Other org card' })
+    const agent = await registerAgent(sql, { orgId: 'org_a', boardId: 'board_1', name: 'alice-agent' })
+
+    const attempt = heartbeat(sql, {
+      orgId: 'org_a', agentId: agent.id, state: 'working', currentCardId: foreign.id,
+    })
+    await expect(attempt).rejects.toMatchObject({ statusCode: 404, code: 'not_found' })
+
+    // Nothing was written: no cross-org pointer, and the failed beat did not land.
+    const after = (await listAgents(sql, 'org_a'))[0]
+    expect(after.current_card_id).toBeNull()
+    expect(after.last_heartbeat_at).toBeNull()
+  })
+
+  it('answers a foreign and a nonexistent current_card_id identically', async () => {
+    const sql = await board()
+    await seedOrg(sql, 'org_b')
+    await seedBoard(sql, 'org_b', 'board_b')
+    const foreign = await createCard(sql, { orgId: 'org_b', boardId: 'board_b', title: 'Other org card' })
+    const agent = await registerAgent(sql, { orgId: 'org_a', boardId: 'board_1', name: 'alice-agent' })
+
+    const beat = (cardId: string) => heartbeat(sql, {
+      orgId: 'org_a', agentId: agent.id, state: 'working', currentCardId: cardId,
+    }).catch((error) => ({ statusCode: error.statusCode, code: error.code, message: error.message }))
+
+    expect(await beat(foreign.id)).toEqual(await beat('card_does-not-exist'))
   })
 })

@@ -150,33 +150,35 @@ describe('hub server', () => {
   })
 
   it('never leaks a raw database error through the ops endpoint', async () => {
-    // presence.ts heartbeat() writes `state` straight into the UPDATE with no
-    // application-level enum check; the `agents.state` CHECK constraint
-    // (migration 002) is the only thing rejecting a bad value, so this raises
-    // a genuine, unmapped Postgres error (SQLSTATE 23514) through the ops
-    // endpoint deterministically — not a HubError, and not something we
-    // special-cased the handler around. Confirms the generic setErrorHandler
-    // catch (the concern raised about registerAgent's race) actually holds
-    // for an unmapped error in general, not just for that one code path.
+    // `expected_version` is validated as a positive integer but not as one that
+    // fits `cards.version` (INTEGER), so a value past int4 makes Postgres fail the
+    // UPDATE's parameter coercion with SQLSTATE 22003. That is a genuine, unmapped
+    // database error raised deterministically through the ops endpoint — not a
+    // HubError, and not something the handler was special-cased around. Confirms
+    // the generic setErrorHandler catch (the concern raised about registerAgent's
+    // race) holds for an unmapped error in general, not just that one code path.
     const hub = await hubFixture()
-    const registered = await hub.server.inject({
+    const created = await hub.server.inject({
       method: 'POST', url: `/api/v1/hub/orgs/${hub.orgId}/ops`, headers: hub.auth(),
-      payload: { op: 'agent.register', payload: { board_id: hub.boardId, name: 'agent-one' } },
+      payload: { op: 'card.create', payload: { board_id: hub.boardId, title: 'Card' } },
     })
-    const agentId = registered.json().result.id
+    const cardId = created.json().result.id
 
     const response = await hub.server.inject({
       method: 'POST', url: `/api/v1/hub/orgs/${hub.orgId}/ops`, headers: hub.auth(),
-      payload: { op: 'agent.heartbeat', payload: { agent_id: agentId, state: 'not-a-real-state' } },
+      payload: {
+        op: 'card.update',
+        payload: { card_id: cardId, expected_version: 1_000_000_000_000_000, title: 'Renamed' },
+      },
     })
 
     expect(response.statusCode).toBe(500)
     const body = response.json()
     expect(body).toEqual({ error: 'internal error', code: 'internal_error' })
     const raw = response.payload.toLowerCase()
-    expect(raw).not.toContain('constraint')
+    expect(raw).not.toContain('out of range')
     expect(raw).not.toContain('sqlstate')
-    expect(raw).not.toContain('23514')
+    expect(raw).not.toContain('22003')
     expect(raw).not.toContain(' at ') // no stack trace frame text
   })
 
