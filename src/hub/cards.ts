@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { appendOrgEvent } from './events.js'
+import { appendOrgEvent, findOrgEventByIdempotencyKey } from './events.js'
 import { ConflictError, NotFoundError, ValidationError } from './errors.js'
 import { withTransaction, type HubSql, type HubSqlPool } from './sql.js'
 import { boundedString, optionalBoundedString, positiveInteger, stringList } from './validate.js'
@@ -40,6 +40,9 @@ export async function createCard(sql: HubSqlPool, input: CreateCardInput): Promi
   const paths = stringList(input.paths, 'paths', 50, 400)
 
   return withTransaction(sql, async (tx) => {
+    const replay = await replayIfIdempotent(tx, input.orgId, input.idempotencyKey)
+    if (replay) return replay
+
     const board = await tx.query('SELECT id FROM boards WHERE org_id = $1 AND id = $2', [input.orgId, input.boardId])
     if (!board.rows[0]) throw new NotFoundError('board not found in this org')
 
@@ -70,6 +73,9 @@ export async function updateCard(sql: HubSqlPool, input: UpdateCardInput): Promi
   const paths = input.paths === undefined ? undefined : stringList(input.paths, 'paths', 50, 400)
 
   return withTransaction(sql, async (tx) => {
+    const replay = await replayIfIdempotent(tx, input.orgId, input.idempotencyKey)
+    if (replay) return replay
+
     const updated = await tx.query<any>(
       `UPDATE cards SET
          title = COALESCE($3, title),
@@ -101,6 +107,9 @@ export async function moveCard(sql: HubSqlPool, input: MoveCardInput): Promise<H
   }
 
   return withTransaction(sql, async (tx) => {
+    const replay = await replayIfIdempotent(tx, input.orgId, input.idempotencyKey)
+    if (replay) return replay
+
     const updated = await tx.query<any>(
       `UPDATE cards SET column_name = $3, version = version + 1, updated_at = now()
        WHERE org_id = $1 AND id = $2 AND version = $4
@@ -127,6 +136,9 @@ export async function claimCard(sql: HubSqlPool, input: ClaimCardInput): Promise
   const agent = boundedString(input.agent, 'agent', 120)
 
   return withTransaction(sql, async (tx) => {
+    const replay = await replayIfIdempotent(tx, input.orgId, input.idempotencyKey)
+    if (replay) return replay
+
     const claimed = await tx.query<any>(
       `UPDATE cards SET owner_agent = $3, version = version + 1, updated_at = now()
        WHERE org_id = $1 AND id = $2 AND (owner_agent IS NULL OR owner_agent = $3)
@@ -146,6 +158,26 @@ export async function claimCard(sql: HubSqlPool, input: ClaimCardInput): Promise
     })
     return card
   })
+}
+
+/**
+ * Idempotent-retry short-circuit: called at the top of every mutating op, before
+ * anything touches the `cards` table. When `idempotencyKey` names an event this org
+ * already recorded, the retried op is presumed to be a replay of that same call — the
+ * daemon's offline queue resends ops after a reconnect, and the caller may not know
+ * whether its first attempt actually committed. We return the entity exactly as the
+ * original call left it (the event's stored payload) and perform no mutation at all,
+ * so a replay never double-applies, never bumps `version` twice, and never appends a
+ * second event. `appendOrgEvent`'s own "same key, different payload" ConflictError
+ * stays in place as a backstop for the race window where two concurrent calls with
+ * the same key both pass this check before either has committed its event.
+ */
+async function replayIfIdempotent(
+  tx: HubSql, orgId: string, idempotencyKey: string | null | undefined,
+): Promise<HubCard | null> {
+  if (!idempotencyKey) return null
+  const prior = await findOrgEventByIdempotencyKey(tx, orgId, idempotencyKey)
+  return prior ? (prior.payload as HubCard) : null
 }
 
 /** Zero rows updated means either the card is gone or someone else moved first. */

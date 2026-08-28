@@ -75,6 +75,21 @@ export async function appendOrgEvent(tx: HubSql, input: AppendOrgEvent): Promise
   return normalize(inserted.rows[0])
 }
 
+/**
+ * Looks up a prior event by idempotency key, for callers that need to short-circuit
+ * a retried mutation BEFORE touching the entity (see cards.ts). Returns null when the
+ * key has never been used in this org.
+ */
+export async function findOrgEventByIdempotencyKey(
+  tx: HubSql, orgId: string, key: string,
+): Promise<HubEvent | null> {
+  const result = await tx.query<HubEvent>(
+    'SELECT * FROM org_events WHERE org_id = $1 AND idempotency_key = $2',
+    [orgId, key],
+  )
+  return result.rows[0] ? normalize(result.rows[0]) : null
+}
+
 /** Events strictly after `since`, oldest first — the daemon's resume read. */
 export async function readOrgEventsSince(
   sql: HubSql, orgId: string, since: number, limit = 500,

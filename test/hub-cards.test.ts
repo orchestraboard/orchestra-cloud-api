@@ -80,6 +80,67 @@ describe('hub card ops', () => {
     expect(again.owner_agent).toBe('agent-one')
   })
 
+  it('replays createCard by idempotency key: one card, same id returned both times', async () => {
+    const sql = await board()
+    const first = await createCard(sql, {
+      orgId: 'org_a', boardId: 'board_1', title: 'First', idempotencyKey: 'key-1',
+    })
+    const second = await createCard(sql, {
+      orgId: 'org_a', boardId: 'board_1', title: 'First', idempotencyKey: 'key-1',
+    })
+
+    expect(second.id).toBe(first.id)
+    expect(second.number).toBe(first.number)
+
+    const allCards = await sql.query<any>('SELECT * FROM cards WHERE board_id = $1', ['board_1'])
+    expect(allCards.rowCount).toBe(1)
+
+    const events = await readOrgEventsSince(sql, 'org_a', 0)
+    expect(events.length).toBe(1)
+  })
+
+  it('replays claimCard by the same owner without bumping version twice', async () => {
+    const sql = await board()
+    const card = await createCard(sql, { orgId: 'org_a', boardId: 'board_1', title: 'Mine' })
+    const first = await claimCard(sql, {
+      orgId: 'org_a', cardId: card.id, agent: 'agent-one', idempotencyKey: 'claim-key-1',
+    })
+    const second = await claimCard(sql, {
+      orgId: 'org_a', cardId: card.id, agent: 'agent-one', idempotencyKey: 'claim-key-1',
+    })
+
+    expect(second.version).toBe(first.version)
+    expect(second.owner_agent).toBe('agent-one')
+
+    const fresh = await getCard(sql, 'org_a', card.id)
+    expect(fresh?.version).toBe(first.version)
+
+    const events = await readOrgEventsSince(sql, 'org_a', 0)
+    expect(events.filter((e) => e.kind === 'card.claimed').length).toBe(1)
+  })
+
+  it('replays moveCard by idempotency key without double-applying', async () => {
+    const sql = await board()
+    const card = await createCard(sql, { orgId: 'org_a', boardId: 'board_1', title: 'Movable' })
+    const first = await moveCard(sql, {
+      orgId: 'org_a', cardId: card.id, expectedVersion: card.version, column: 'in_progress',
+      idempotencyKey: 'move-key-1',
+    })
+    const second = await moveCard(sql, {
+      orgId: 'org_a', cardId: card.id, expectedVersion: card.version, column: 'in_progress',
+      idempotencyKey: 'move-key-1',
+    })
+
+    expect(second.version).toBe(first.version)
+    expect(second.column).toBe('in_progress')
+
+    const fresh = await getCard(sql, 'org_a', card.id)
+    expect(fresh?.version).toBe(first.version)
+
+    const events = await readOrgEventsSince(sql, 'org_a', 0)
+    expect(events.filter((e) => e.kind === 'card.moved').length).toBe(1)
+  })
+
   it('refuses to read or write another org\'s card', async () => {
     const sql = await board()
     await seedOrg(sql, 'org_b')
