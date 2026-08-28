@@ -1,5 +1,6 @@
 import type { FastifyPluginAsync, FastifyPluginOptions, FastifyRequest } from 'fastify'
 import { claimCard, createCard, moveCard, updateCard } from '../cards.js'
+import { assertOrgWritable } from '../entitlements.js'
 import { latestOrgSeq, readOrgEventsSince } from '../events.js'
 import { drainInbox, sendMail } from '../mail.js'
 import { heartbeat, listAgents, registerAgent } from '../presence.js'
@@ -33,6 +34,11 @@ export const hubOpsPlugin: FastifyPluginAsync<HubOpsRouteOptions> = async (app, 
     const body = (request.body ?? {}) as Record<string, any>
     const op = typeof body.op === 'string' ? body.op : ''
     if (!OPS.has(op)) throw new ValidationError(`unknown op: ${op || '(missing)'}`)
+
+    // Every op in OPS mutates something — this endpoint has no read-only op today —
+    // so one check up front covers all of them. GET routes below never call this: a
+    // suspended org still serves reads, only writes are refused.
+    await assertOrgWritable(sql, orgId)
 
     const payload = (body.payload ?? {}) as Record<string, any>
     const idempotencyKey = typeof body.idempotency_key === 'string' ? body.idempotency_key : null

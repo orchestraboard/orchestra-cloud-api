@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { appendOrgEvent } from './events.js'
+import { assertAgentCapacity } from './entitlements.js'
 import { NotFoundError, ValidationError } from './errors.js'
 import { requireOrgEntity } from './scope.js'
 import { withTransaction, type HubSql, type HubSqlPool } from './sql.js'
@@ -43,6 +44,13 @@ export async function registerAgent(sql: HubSqlPool, input: RegisterAgentInput):
       [input.orgId, input.boardId, name],
     )
     if (existing.rows[0]) return normalize(existing.rows[0])
+
+    // Only a genuinely new agent is weighed against the cap — a daemon reconnecting
+    // under a name it already registered takes the early return above and never
+    // reaches here, so it can't be refused just because the org is at capacity.
+    // See entitlements.ts's doc comment on assertAgentCapacity for why this check
+    // lives here rather than at the ops-endpoint dispatch for `agent.register`.
+    await assertAgentCapacity(tx, input.orgId)
 
     const inserted = await tx.query<HubAgent>(
       `INSERT INTO agents (id, org_id, board_id, device_id, name)

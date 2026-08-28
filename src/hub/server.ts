@@ -8,6 +8,7 @@ import { verifyClerkToken, resolveOrgForClerk } from './clerk.js'
 import { hubClerkWebhookPlugin } from './webhooks/clerk.js'
 import { hubStripeWebhookPlugin, type StripeWebhookClient } from './webhooks/stripe.js'
 import { createCheckoutSession, createPortalSession, type StripeBillingClient } from './billing.js'
+import { entitlementsFor } from './entitlements.js'
 import { HubError, ValidationError } from './errors.js'
 import { registerHubCors } from './cors.js'
 import type { HubSqlPool } from './sql.js'
@@ -246,6 +247,31 @@ export function buildHubServer(sql: HubSqlPool, opts: HubServerOptions = {}): Fa
     const orgId = requireHubOrgId(request)
     const result = await createPortalSession(sql, stripe, { orgId })
     return reply.send(result)
+  })
+
+  // A read, like the org-scoped GETs in routes/ops.ts — never gated by
+  // `assertOrgWritable`, deliberately: a suspended org must still be able to load its
+  // own billing page (Task 7) to see why it's suspended and fix it. `seats`/`agents`
+  // pair the cached entitlement against a LIVE count each time — usage is never
+  // cached (see entitlements.ts) so this can't drift from what `assertAgentCapacity`
+  // itself would see. `tier` isn't part of `EntitlementSnapshot`'s contract (kept
+  // narrow to what Task 6's enforcement functions need) but is cheap to add here for
+  // the billing page's "current plan" display.
+  server.get('/api/v1/hub/orgs/:orgId/entitlements', async (request, reply) => {
+    const orgId = requireHubOrgId(request)
+    const entitlement = await entitlementsFor(sql, orgId)
+    const [memberships, agents, subscription] = await Promise.all([
+      sql.query<{ n: string }>('SELECT count(*)::text AS n FROM memberships WHERE org_id = $1', [orgId]),
+      sql.query<{ n: string }>("SELECT count(*)::text AS n FROM agents WHERE org_id = $1 AND state <> 'offline'", [orgId]),
+      sql.query<{ tier: string }>('SELECT tier FROM subscriptions WHERE org_id = $1', [orgId]),
+    ])
+    return reply.send({
+      tier: subscription.rows[0]?.tier ?? 'none',
+      status: entitlement.status,
+      sso: entitlement.sso,
+      seats: { used: Number(memberships.rows[0]?.n ?? 0), entitled: entitlement.seats },
+      agents: { used: Number(agents.rows[0]?.n ?? 0), entitled: entitlement.concurrentAgents },
+    })
   })
 
   server.get('/healthz', async () => ({ ok: true, presence_ttl_seconds: opts.presenceTtlSeconds ?? 45 }))
