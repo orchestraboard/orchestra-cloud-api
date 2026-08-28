@@ -9,6 +9,8 @@ export interface HubSyncRouteOptions extends FastifyPluginOptions {
   sql: HubSqlPool
   broadcast: HubBroadcaster
   heartbeatMs?: number
+  /** Test seam only — production always uses the default `BACKLOG_PAGE`. */
+  backlogPageSize?: number
 }
 
 const BACKLOG_PAGE = 500
@@ -110,29 +112,58 @@ export const hubSyncPlugin: FastifyPluginAsync<HubSyncRouteOptions> = async (app
       connection: 'keep-alive',
     })
 
+    let ping: ReturnType<typeof setInterval> | null = null
+    let liveUnsubscribe: (() => void) | null = null
+    let torndown = false
+
+    // Registered BEFORE the drain starts, not after `streamOrgEvents` resolves: the
+    // broadcaster subscription attaches at the very top of that call, so a client
+    // that disconnects while a long backlog drain is still in flight must be cleaned
+    // up right away rather than leaking the subscription (and later installing a
+    // ping for a connection that's already dead) until the drain finally finishes.
+    // `liveUnsubscribe` is captured synchronously the moment `subscribe()` runs
+    // below — `streamOrgEvents` calls it before its first `await` — so it's set well
+    // before this handler can yield back to the event loop.
+    const teardown = () => {
+      if (torndown) return
+      torndown = true
+      request.raw.off('close', teardown)
+      if (ping) clearInterval(ping)
+      liveUnsubscribe?.()
+    }
+    request.raw.on('close', teardown)
+
     const write = (event: HubEvent) => {
+      if (torndown) return
       reply.raw.write(`id: ${event.seq}\ndata: ${JSON.stringify(event)}\n\n`)
     }
 
-    const unsubscribe = await streamOrgEvents({
+    await streamOrgEvents({
       since,
-      pageSize: BACKLOG_PAGE,
+      pageSize: options.backlogPageSize ?? BACKLOG_PAGE,
       readBacklog: (cursor, limit) => readOrgEventsSince(sql, orgId, cursor, limit),
-      subscribe: (listener) => broadcast.subscribe(orgId, listener),
+      subscribe: (listener) => {
+        const unsubscribe = broadcast.subscribe(orgId, listener)
+        liveUnsubscribe = unsubscribe
+        return unsubscribe
+      },
       write,
     })
 
+    // The client may already be gone by the time the drain finishes — either it
+    // disconnected mid-drain (handled above) or the raw socket was torn down some
+    // other way we haven't observed yet. Either way, don't install a ping for a dead
+    // connection and don't try to end an already-torn-down response.
+    if (torndown) return
+    if (request.raw.destroyed) { teardown(); return }
+
     if (catchupOnly) {
-      unsubscribe()
+      teardown()
       reply.raw.end()
       return
     }
 
-    const ping = setInterval(() => reply.raw.write(': ping\n\n'), heartbeatMs)
-    request.raw.on('close', () => {
-      clearInterval(ping)
-      unsubscribe()
-    })
+    ping = setInterval(() => reply.raw.write(': ping\n\n'), heartbeatMs)
   })
 }
 

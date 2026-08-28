@@ -1,8 +1,11 @@
+import Fastify from 'fastify'
 import { describe, it, expect, vi, afterEach } from 'vitest'
 import { hubFixture, closeHubServers } from './support/hub-fixture.js'
 import { createCard } from '../src/hub/cards.js'
-import { streamOrgEvents } from '../src/hub/routes/sync.js'
+import { hubSyncPlugin, streamOrgEvents } from '../src/hub/routes/sync.js'
+import { HubBroadcaster } from '../src/hub/broadcast.js'
 import type { HubEvent } from '../src/hub/types.js'
+import type { HubSqlPool } from '../src/hub/sql.js'
 
 afterEach(async () => { await closeHubServers() })
 
@@ -20,6 +23,21 @@ async function until(cond: () => boolean, tries = 200): Promise<void> {
     await new Promise((r) => setTimeout(r, 5))
   }
   throw new Error('condition never became true')
+}
+
+/**
+ * A bare Fastify app with only `hubSyncPlugin` registered — no auth, no ops route —
+ * so a test can supply a `sql` whose `.query()` it fully controls (to hold a backlog
+ * page's read open) without needing a real, timing-dependent multi-page drain against
+ * PGlite.
+ */
+async function buildBareSyncApp(sql: HubSqlPool, broadcast: HubBroadcaster, backlogPageSize?: number) {
+  const app = Fastify()
+  app.decorateRequest('hubOrgId', null)
+  app.addHook('onRequest', async (request) => { request.hubOrgId = 'org_a' })
+  app.register(hubSyncPlugin, { sql, broadcast, prefix: '/api/v1/hub', backlogPageSize })
+  await app.ready()
+  return app
 }
 
 describe('hub sync stream', () => {
@@ -117,6 +135,51 @@ describe('hub sync stream', () => {
     await until(() => hub.broadcast.listenerCount(hub.orgId) === 0)
   })
 
+  it('cleans up the subscription and installs no ping when the client disconnects mid-drain', async () => {
+    const broadcast = new HubBroadcaster()
+    const row = (seq: number): HubEvent => ({
+      id: `e${seq}`, org_id: 'org_a', seq, kind: 'card.created',
+      board_id: null, actor_device_id: null, payload: {}, created_at: 'now',
+    })
+
+    let calls = 0
+    let resolveSecondPage!: (rows: HubEvent[]) => void
+    const sql = {
+      query: vi.fn(async (_text: string, _params?: unknown[]) => {
+        calls++
+        if (calls === 1) return { rows: [row(1), row(2)], rowCount: 2 } // a full page (pageSize=2) — the drain asks for a second
+        return new Promise((resolve) => {
+          resolveSecondPage = (rows) => resolve({ rows, rowCount: rows.length })
+        })
+      }),
+    } as unknown as HubSqlPool
+
+    const app = await buildBareSyncApp(sql, broadcast, 2)
+    const controller = new AbortController()
+
+    const responsePromise = app.inject({
+      method: 'GET', url: '/api/v1/hub/orgs/org_a/sync?since=0',
+      payloadAsStream: true, signal: controller.signal,
+    })
+
+    // Wait for the first page to land and the second page's read to be in flight —
+    // the drain is now genuinely stuck mid-backlog.
+    await until(() => calls === 2)
+    expect(broadcast.listenerCount('org_a')).toBe(1)
+
+    // The client vanishes while that second read is still pending.
+    controller.abort()
+    await until(() => broadcast.listenerCount('org_a') === 0)
+
+    // Let the stuck read resolve well after the disconnect. This must not resurrect
+    // a ping or throw trying to write to a torn-down connection.
+    resolveSecondPage([])
+    await new Promise((r) => setImmediate(r))
+    await responsePromise.catch(() => {}) // aborted — light-my-request rejects; that's expected
+
+    await app.close()
+  })
+
   it('publishes no second live event for a replayed idempotency key', async () => {
     const hub = await hubFixture()
     const seen: HubEvent[] = []
@@ -162,6 +225,42 @@ describe('hub broadcaster', () => {
     broadcaster.publish({ id: 'e2', org_id: 'org_a', seq: 2, kind: 'card.created',
       board_id: null, actor_device_id: null, payload: {}, created_at: 'now' })
     expect(seenA.length).toBe(1)
+  })
+
+  const evt = (orgId: string, seq: number): HubEvent => ({
+    id: `${orgId}-${seq}`, org_id: orgId, seq, kind: 'card.created',
+    board_id: null, actor_device_id: null, payload: {}, created_at: 'now',
+  })
+
+  it('never double-delivers a seq when two concurrent ops publish overlapping ranges', () => {
+    const broadcaster = new HubBroadcaster()
+    const seen: number[] = []
+    broadcaster.subscribe('org_a', (e) => seen.push(e.seq))
+
+    // op A's publish loop appends and publishes seq 1, then seq 2
+    broadcaster.publish(evt('org_a', 1))
+    broadcaster.publish(evt('org_a', 2))
+    // op B raced with A: its own `before`/`after` snapshot span the same window, so
+    // its publish loop reads the same union [1, 2] plus its own new seq 3
+    broadcaster.publish(evt('org_a', 1))
+    broadcaster.publish(evt('org_a', 2))
+    broadcaster.publish(evt('org_a', 3))
+
+    expect(seen).toEqual([1, 2, 3])
+  })
+
+  it('does not let one org de-dup suppress another org', () => {
+    const broadcaster = new HubBroadcaster()
+    const seenA: number[] = []
+    const seenB: number[] = []
+    broadcaster.subscribe('org_a', (e) => seenA.push(e.seq))
+    broadcaster.subscribe('org_b', (e) => seenB.push(e.seq))
+
+    broadcaster.publish(evt('org_a', 5))
+    broadcaster.publish(evt('org_b', 1)) // org_b starts at seq 1 — must not be swallowed by org_a's seq 5
+
+    expect(seenA).toEqual([5])
+    expect(seenB).toEqual([1])
   })
 })
 
