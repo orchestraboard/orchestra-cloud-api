@@ -4,6 +4,7 @@ import { hubSyncPlugin } from './routes/sync.js'
 import { HubBroadcaster } from './broadcast.js'
 import { verifyDeviceToken, DEVICE_TOKEN_PREFIX, type HubDevice } from './devices.js'
 import { verifyClerkToken, resolveOrgForClerk } from './clerk.js'
+import { hubClerkWebhookPlugin } from './webhooks/clerk.js'
 import { HubError } from './errors.js'
 import { registerHubCors } from './cors.js'
 import type { HubSqlPool } from './sql.js'
@@ -27,6 +28,10 @@ export interface HubServerOptions {
   webOrigin?: string
   /** From HubEnv#clerkSecretKey. Omitted (or unset) means Clerk JWTs are never accepted — only device tokens. */
   clerkSecretKey?: string
+  /** From HubEnv#clerkWebhookSigningSecret. Verifies Clerk's own webhook signature at
+   * POST /webhooks/clerk — see src/hub/webhooks/clerk.ts. Omitted (or unset) means that
+   * route always answers 500 rather than ever accepting an unsigned payload. */
+  clerkWebhookSigningSecret?: string
 }
 
 /**
@@ -182,6 +187,11 @@ export function buildHubServer(sql: HubSqlPool, opts: HubServerOptions = {}): Fa
   server.decorate('hubBroadcast', broadcast)
   server.register(hubOpsPlugin, { sql, broadcast, prefix: '/api/v1/hub' })
   server.register(hubSyncPlugin, { sql, broadcast, prefix: '/api/v1/hub' })
+  // Mounted OUTSIDE `/api/v1/hub/` — the onRequest hook above returns early for
+  // any URL not under that prefix, so this route is unauthenticated by that
+  // hook by design: it verifies Clerk's own Svix signature instead of a
+  // bearer token. See src/hub/webhooks/clerk.ts.
+  server.register(hubClerkWebhookPlugin, { sql, env: { clerkWebhookSigningSecret: opts.clerkWebhookSigningSecret } })
   server.get('/healthz', async () => ({ ok: true, presence_ttl_seconds: opts.presenceTtlSeconds ?? 45 }))
 
   return server
