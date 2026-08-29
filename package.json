@@ -1,138 +1,44 @@
 {
-  "name": "orchestra-board",
-  "version": "0.1.1",
-  "description": "Orchestra — live project board where Claude Code and Codex agents coordinate work",
+  "name": "@orchestraboard/hub",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Hosted multi-tenant API for Orchestra Cloud",
   "license": "FSL-1.1-ALv2",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Armin2708/Orchestra.git"
+    "url": "git+https://github.com/orchestraboard/orchestra-hub.git"
   },
-  "homepage": "https://github.com/Armin2708/Orchestra#readme",
+  "homepage": "https://orchestraboard.com",
   "bugs": {
-    "url": "https://github.com/Armin2708/Orchestra/issues"
+    "url": "https://github.com/orchestraboard/orchestra-hub/issues"
   },
-  "keywords": [
-    "claude-code",
-    "codex",
-    "openai",
-    "multi-agent",
-    "orchestration",
-    "kanban",
-    "developer-tools"
-  ],
   "type": "module",
   "engines": {
     "node": ">=22.20.0 <23",
     "npm": ">=10.9.3 <11"
   },
-  "bin": {
-    "orchestra": "dist/cli.js"
-  },
-  "files": [
-    "dist",
-    "web/dist",
-    "hooks",
-    "workflows",
-    ".claude-plugin",
-    ".codex-plugin",
-    "environment-compatibility.json",
-    "README.md",
-    "brand/identity/orchestra-mark.svg",
-    "docs/agent-os-compatibility-projections.md",
-    "docs/agent-os-forward-migrations.md",
-    "docs/agent-os-current-baseline.json",
-    "docs/agent-os-current-baseline.md",
-    "docs/agent-os-migration-controls.json",
-    "docs/agent-os-migration-controls.md",
-    "docs/agent-team-operating-model.md",
-    "docs/agent-os.md",
-    "docs/codex.md",
-    "docs/delivery-trackbook.md",
-    "docs/operator-preview.md",
-    "docs/provider-subscription-strategy.md",
-    "docs/remote-mobile-threat-control-matrix.json",
-    "docs/remote-mobile-threat-model.md",
-    "docs/remote-preview.md",
-    "docs/support-preview.md",
-    "docs/supported-environments.md",
-    "docs/token-diet.md",
-    "docs/outcome-benchmarking.md",
-    "docs/beta-release-monitoring.md",
-    "docs/beta-release-operations.md",
-    "docs/api-event-schema-v1.md",
-    "docs/data-recovery.md",
-    "docs/getting-started.md",
-    "docs/lifecycle-demo.md",
-    "docs/qa016-dogfood.md",
-    "docs/remote-access-security.md",
-    "docs/telemetry-support.md",
-    "docs/troubleshooting.md",
-    "docs/upgrade-compatibility.md",
-    "scripts/backup-orchestra-state.sh",
-    "scripts/outcome-benchmark.mjs",
-    "scripts/beta-release-monitor.mjs",
-    "scripts/beta-release-contract.json",
-    "scripts/beta-dogfood-plan.json",
-    "scripts/exact-commit-contract.mjs",
-    "scripts/package-source-identity.mjs",
-    "scripts/retained-package-artifact.mjs",
-    "scripts/run-beta-dogfood.mjs",
-    "scripts/tar-artifact-integrity.mjs",
-    "scripts/copy-hub-migrations.mjs"
-  ],
   "scripts": {
-    "baseline:agent-os": "node scripts/capture-agent-os-baseline.mjs",
-    "build": "tsup && node scripts/copy-hub-migrations.mjs && node scripts/fix-bin.mjs",
-    "package:artifact": "node scripts/package-install-smoke.mjs",
-    "benchmark:outcomes": "node scripts/outcome-benchmark.mjs",
-    "beta:monitor": "node scripts/beta-release-monitor.mjs",
-    "release:contract": "node scripts/verify-beta-release-contract.mjs",
-    "release:preflight": "node scripts/beta-release-preflight.mjs",
-    "release:platform": "node scripts/validate-beta-platform-lifecycle.mjs",
-    "quality:dogfood": "node scripts/run-beta-dogfood.mjs",
-    "accept:codex": "tsx src/provider-acceptance-cli.ts",
-    "check:codex-app-server": "node scripts/check-codex-app-server-contract.mjs",
-    "check:codex-protocol": "node scripts/check-codex-protocol.mjs",
-    "prepack": "npm run build && cd web && npm ci --dry-run=false && npm run build",
-    "test": "vitest run",
+    "build": "tsup && node scripts/copy-hub-migrations.mjs",
     "start": "node dist/hub-entry.js",
-    "dev": "tsx src/cli.ts serve",
-    "check:provider-catalog": "node scripts/check-provider-catalog.mjs"
+    "test": "vitest run"
   },
   "dependencies": {
-    "@agentclientprotocol/sdk": "0.23.0",
-    "@anthropic-ai/claude-agent-sdk": "0.3.212",
     "@clerk/backend": "^3.16.12",
     "@fastify/cors": "^11.3.0",
-    "@fastify/static": "^10.1.2",
-    "@hono/node-server": "2.0.12",
-    "@modelcontextprotocol/sdk": "1.30.0",
-    "better-sqlite3": "^12.11.1",
-    "commander": "^15.0.0",
     "fastify": "^5.10.0",
-    "node-pty": "1.2.0-beta.14",
     "pg": "^8.23.0",
-    "picomatch": "^4.0.5",
-    "qrcode-terminal": "^0.12.0",
-    "stripe": "^22.6.0",
-    "web-push": "^3.6.7",
-    "zod": "4.4.3"
-  },
-  "overrides": {
-    "esbuild": "0.28.1"
+    "stripe": "^22.6.0"
   },
   "devDependencies": {
     "@electric-sql/pglite": "^0.2.17",
-    "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^26.1.1",
     "@types/pg": "^8.23.1",
-    "@types/picomatch": "^4.0.3",
-    "@types/web-push": "^3.6.4",
-    "ajv": "^8.20.0",
+    "standardwebhooks": "^1.0.0",
     "tsup": "^8.5.1",
-    "tsx": "^4.23.1",
     "typescript": "^7.0.2",
-    "vitest": "^4.1.10",
-    "yaml": "^2.9.0"
+    "vitest": "^4.1.10"
+  },
+  "overrides": {
+    "esbuild": "0.28.1"
   }
 }

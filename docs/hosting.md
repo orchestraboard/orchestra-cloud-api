@@ -11,7 +11,8 @@ credentials exist.
 
 ## Architecture in one paragraph
 
-Browsers only ever talk to two hosts: the Vercel-hosted static SPA (`web/`), and the Railway
+Browsers only ever talk to two hosts: the Vercel-hosted static SPA in
+[`orchestraboard/orchestra-cloud`](https://github.com/orchestraboard/orchestra-cloud), and the Railway
 hub API it calls over `fetch`/SSE. The hub is the only thing that talks to Postgres, Clerk's
 backend API, and Stripe. Clerk and Stripe both push webhooks straight at the hub (never at
 Vercel) because a webhook's whole job is to mutate hub state. A daemon (an `orchestra` agent
@@ -24,7 +25,7 @@ Browser  ──Clerk session JWT──▶  Railway hub  ──▶  Supabase Post
    │                                  │  ▲
    │ (static assets)                  │  │
    ▼                                  │  └── Clerk Backend API (token verify)
-Vercel (web/, built with Vite)        │
+Vercel (orchestra-cloud, Vite)        │
                                        │
 Daemon  ──device-token Bearer──▶──────┘
                                        │
@@ -67,7 +68,7 @@ Provision in this order — each step's output feeds the next one's environment 
    URL and passes `/healthz`, note that URL — it's `HUB_BASE_URL` for the record, and it's what
    both webhooks (step 6) point at.
 
-5. **Vercel project.** Deploy `web/` using the root `vercel.json` (see
+5. **Vercel project.** Deploy `orchestraboard/orchestra-cloud` using its root `vercel.json` (see
    [Vercel config](#vercel-config)). Set the two build-time env vars. Once it has a public URL,
    go back to Railway and set `WEB_ORIGIN` to that exact URL (protocol + host, no trailing
    slash — see the `WEB_ORIGIN` row in [Environment variables](#environment-variables) below),
@@ -122,7 +123,7 @@ pooler mode before anything else.
 ### Vite env vars are build-time, not runtime
 
 `VITE_HUB_BASE_URL` and `VITE_CLERK_PUBLISHABLE_KEY` are read via `import.meta.env` in
-`web/src/hubApi.ts` and `web/src/main.tsx`. Vite **inlines** `import.meta.env.VITE_*` values into
+`orchestra-cloud/web/src/hubApi.ts` and `orchestra-cloud/web/src/main.tsx`. Vite **inlines** `import.meta.env.VITE_*` values into
 the built JS at `vite build` time — they are not read from the environment when the server
 answers a request the way a typical backend `process.env` read would be. This means:
 
@@ -137,7 +138,7 @@ answers a request the way a typical backend `process.env` read would be. This me
 
 ## Vercel config
 
-`vercel.json` (repo root):
+`vercel.json` in the root of `orchestraboard/orchestra-cloud`:
 
 ```json
 {
@@ -155,7 +156,7 @@ Directory at `web/`" approach, for two reasons:
 1. Vercel resolves `vercel.json` **inside** the configured Root Directory. If Root Directory
    were set to `web`, this file would need to live at `web/vercel.json` instead of the repo
    root, and the Root Directory toggle itself lives only in the Vercel dashboard — it is not
-   captured in any file this repository tracks. That means "redo the whole deployment from
+   captured in a tracked file. That means "redo the whole deployment from
    scratch" would require remembering an undocumented dashboard setting in addition to the
    files in git.
 2. With Root Directory left at the repo root, this single `vercel.json` is the entire, git-
