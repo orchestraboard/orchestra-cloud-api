@@ -247,12 +247,10 @@ projects in this environment, and holds no Clerk secret key or Stripe restricted
 not treat anything below as verified — it is a checklist to execute once those accounts exist,
 written to be followed literally, with the expected result at each step.
 
-There is no `orchestra hub join <url> <token>` CLI command in this codebase yet — a daemon
-authenticates to the hub's REST API with a device-token `Authorization: Bearer` header
-(`src/hub/server.ts`), the same way the browser does with a Clerk session JWT. Steps 5–7 below
-therefore simulate "a daemon" with `curl` against that API rather than assuming a client command
-that doesn't exist. If a real daemon-join CLI lands later, replace steps 5–7 with it and keep the
-rest.
+Daemons join with `orchestra org join`. The command verifies the one-time device token before
+storing it in `ORCHESTRA_HOME/org.json` with mode `0600`, then starts (or restarts) the local
+daemon so the SSE sync loop is live immediately. Prefer `--token-stdin`: the token does not enter
+shell history and is never printed by Orchestra.
 
 1. **Sign up.** Open the Vercel URL. Sign up via Clerk's hosted UI.
    *Expected:* Clerk redirects back into the app; `ClerkAuthControls`
@@ -284,40 +282,34 @@ rest.
    *Expected:* Plan shows "Cloud"; seat/agent meters reflect `cloud_base_monthly`'s fixed 3
    included seats (`deriveQuantities` in `billing.ts`).
 
-5. **Mint a device token** (simulating "join a daemon"). While signed in as an org member, call:
+5. **Join a daemon.** In the hosted UI, choose **Connect a daemon**, name the device, and generate
+   its one-time token. Then run this on the machine being connected:
    ```bash
-   curl -i -X POST "https://<railway-url>/api/v1/hub/orgs/<orgId>/devices" \
-     -H "Authorization: Bearer <clerk-session-jwt>" \
-     -H "Content-Type: application/json" \
-     -d '{"name": "smoke-test-daemon"}'
+   orchestra org join \
+     --hub "https://<railway-url>" \
+     --org "<orgId>" \
+     --token-stdin
    ```
-   *Expected:* **`201`** (not `200` — the route answers `reply.code(201)`) with a `token` field
-   prefixed `orchestra_device_v1.`. Save it as `$DEVICE_TOKEN`. Note this must be a **Clerk
-   session JWT**: a device token cannot mint another device token, cannot create a project, and
-   cannot reach either billing route.
+   Paste the token on stdin and finish with EOF (Ctrl-D on macOS/Linux, Ctrl-Z then Enter on
+   Windows). *Expected:* `joined <orgId> at <hub> as <device>`. A rejected, revoked, or wrong-org
+   token is refused before anything is saved. The command never prints the token.
 
-6. **Get a board id.** Every org created through Clerk gets a default project and board
-   automatically (the `organization.created` webhook calls `ensureDefaultProject` —
-   `src/hub/projects.ts`), so one already exists:
+6. **Verify the connection.**
    ```bash
-   curl "https://<railway-url>/api/v1/hub/orgs/<orgId>/boards" \
-     -H "Authorization: Bearer <clerk-session-jwt>"
+   orchestra org status
    ```
-   *Expected:* `200` with `{"boards": [{"id": "board_…", "project_name": "Default project", …}]}`.
-   Save the `id` as `$BOARD_ID`. To make another, `POST /api/v1/hub/orgs/<orgId>/projects` with
-   `{"name": "…"}` returns `201` and `{project, board}` (a Clerk JWT, and the org must have an
-   active subscription — creating a project is a write).
+   *Expected:* the hub URL, org id, device name, and `credential: verified`; no token appears.
+   The daemon uses the org's seeded **Default project** board. If the hub is unreachable, local
+   single-machine operation remains available and the status names the verification failure.
 
-7. **Create a card "from one machine"** using that device token as the daemon would:
+7. **Create a card from the joined machine.** From a registered local Orchestra project, run:
    ```bash
-   curl -i -X POST "https://<railway-url>/api/v1/hub/orgs/<orgId>/ops" \
-     -H "Authorization: Bearer $DEVICE_TOKEN" \
-     -H "Content-Type: application/json" \
-     -d '{"op": "card.create", "payload": {"board_id": "'"$BOARD_ID"'", "title": "smoke test card"}}'
+   orchestra card create "smoke test card"
    ```
-   *Expected:* `200` with the created card and a `seq`. The payload key is **`board_id`**, snake
-   case — `runOp` in `src/hub/routes/ops.ts` reads `payload.board_id`; a `boardId` key resolves
-   to `undefined` and the request fails with a `card.create` validation error, not a card.
+   *Expected:* the local command succeeds exactly as it does without an org, and the daemon's
+   durable outbox relays the create to the hosted Default project using an enqueue-time
+   idempotency key. The card appears in the hosted board without exposing a bearer token to the
+   command or shell.
 
 8. **See it on another machine.** In a **second** browser session (or a private window) signed in
    as a different member of the same org, open the board.
