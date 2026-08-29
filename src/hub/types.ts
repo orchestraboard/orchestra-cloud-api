@@ -10,6 +10,7 @@ export interface HubEvent {
   kind: HubEventKind
   board_id: string | null
   actor_device_id: string | null
+  idempotency_key: string | null
   payload: unknown
   created_at: string
 }
