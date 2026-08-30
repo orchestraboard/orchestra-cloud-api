@@ -111,6 +111,12 @@ export const hubSyncPlugin: FastifyPluginAsync<HubSyncRouteOptions> = async (app
       'cache-control': 'no-store',
       connection: 'keep-alive',
     })
+    // The first byte must flow IMMEDIATELY: an at-head client (empty backlog) would
+    // otherwise receive nothing until the first ping, and edge proxies (Railway's
+    // included) hold the response headers until the first body byte — which starved
+    // the daemon's connect deadline and made an idle org flap live/offline forever.
+    // A comment frame is SSE-legal and ignored by every client.
+    reply.raw.write(': connected\n\n')
 
     let ping: ReturnType<typeof setInterval> | null = null
     let liveUnsubscribe: (() => void) | null = null
