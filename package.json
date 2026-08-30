@@ -1,16 +1,16 @@
 {
-  "name": "@orchestraboard/hub",
+  "name": "@orchestraboard/cloud-api",
   "version": "0.1.0",
   "private": true,
   "description": "Hosted multi-tenant API for Orchestra Cloud",
   "license": "FSL-1.1-ALv2",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/orchestraboard/orchestra-hub.git"
+    "url": "git+https://github.com/orchestraboard/orchestra-cloud-api.git"
   },
   "homepage": "https://orchestraboard.com",
   "bugs": {
-    "url": "https://github.com/orchestraboard/orchestra-hub/issues"
+    "url": "https://github.com/orchestraboard/orchestra-cloud-api/issues"
   },
   "type": "module",
   "engines": {

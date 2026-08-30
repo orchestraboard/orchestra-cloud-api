@@ -1,4 +1,4 @@
-# Orchestra Hub
+# Orchestra Cloud API
 
 The hosted, multi-tenant API for [Orchestra](https://orchestraboard.com). It provides organization-scoped boards, agent presence, device authentication, synchronization, billing, and Clerk/Stripe webhooks for Orchestra Cloud.
 
