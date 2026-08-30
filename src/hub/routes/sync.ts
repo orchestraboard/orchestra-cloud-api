@@ -116,6 +116,13 @@ export const hubSyncPlugin: FastifyPluginAsync<HubSyncRouteOptions> = async (app
     let liveUnsubscribe: (() => void) | null = null
     let torndown = false
 
+    // A device-token stream is a daemon: register it as connected for as long as the
+    // stream lives, so the devices listing can say "this machine is on right now".
+    // Clerk-authenticated requests (a browser) carry no hubDevice and register nothing.
+    const detachDevice = request.hubDevice
+      ? broadcast.attachDevice(orgId, request.hubDevice.id)
+      : null
+
     // Registered BEFORE the drain starts, not after `streamOrgEvents` resolves: the
     // broadcaster subscription attaches at the very top of that call, so a client
     // that disconnects while a long backlog drain is still in flight must be cleaned
@@ -130,6 +137,7 @@ export const hubSyncPlugin: FastifyPluginAsync<HubSyncRouteOptions> = async (app
       request.raw.off('close', teardown)
       if (ping) clearInterval(ping)
       liveUnsubscribe?.()
+      detachDevice?.()
     }
     request.raw.on('close', teardown)
 

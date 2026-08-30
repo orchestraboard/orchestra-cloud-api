@@ -134,6 +134,28 @@ describe('device listing and revocation', () => {
     expect(JSON.stringify(response.json())).not.toContain('token_hash')
   })
 
+  it('reports who owns each device and whether its sync stream is open right now', async () => {
+    const hub = await clerkMemberFixture()
+    const clerk = { authorization: `Bearer ${fakeClerkToken('clerk_user_1', 'clerk_org_a')}` }
+    await hub.server.inject({
+      method: 'POST', url: '/api/v1/hub/orgs/org_a/devices', headers: clerk, payload: { name: 'laptop' },
+    })
+
+    const before = await hub.server.inject({ method: 'GET', url: '/api/v1/hub/orgs/org_a/devices', headers: clerk })
+    const [idle] = before.json().devices
+    expect(idle.connected).toBe(false)
+    expect(idle.owner_user_id).toBe('user_1')
+
+    // The registry, not a heartbeat guess: attach the device as the sync route does
+    // while its stream is open, and the listing flips — then flips back on detach.
+    const detach = hub.server.hubBroadcast.attachDevice('org_a', idle.id)
+    const during = await hub.server.inject({ method: 'GET', url: '/api/v1/hub/orgs/org_a/devices', headers: clerk })
+    expect(during.json().devices[0].connected).toBe(true)
+    detach()
+    const after = await hub.server.inject({ method: 'GET', url: '/api/v1/hub/orgs/org_a/devices', headers: clerk })
+    expect(after.json().devices[0].connected).toBe(false)
+  })
+
   it('revoking a device makes its token stop working on the very next request', async () => {
     const hub = await clerkMemberFixture()
     const clerk = { authorization: `Bearer ${fakeClerkToken('clerk_user_1', 'clerk_org_a')}` }

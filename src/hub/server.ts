@@ -457,12 +457,23 @@ export function buildHubServer(sql: HubSqlPool, opts: HubServerOptions = {}): Fa
   server.get('/api/v1/hub/orgs/:orgId/devices', async (request, reply) => {
     const orgId = requireHubOrgId(request)
     await requireMembership(sql, request, orgId)
-    const devices = await sql.query(
-      `SELECT id, org_id, membership_id, name, created_at, last_seen_at, revoked_at
-       FROM devices WHERE org_id = $1 ORDER BY created_at ASC, id ASC`,
+    // Each device is one person's daemon on one machine, so the listing carries who
+    // it belongs to (via membership → user) and whether its sync stream is open
+    // RIGHT NOW (`connected`, from the broadcaster's live registry — not a
+    // heartbeat guess).
+    const devices = await sql.query<any>(
+      `SELECT d.id, d.org_id, d.membership_id, d.name, d.created_at, d.last_seen_at, d.revoked_at,
+              u.id AS owner_user_id, u.display_name AS owner_display_name, u.email AS owner_email
+       FROM devices d
+       LEFT JOIN memberships m ON m.id = d.membership_id
+       LEFT JOIN users u ON u.id = m.user_id
+       WHERE d.org_id = $1 ORDER BY d.created_at ASC, d.id ASC`,
       [orgId],
     )
-    return reply.send({ devices: devices.rows })
+    const connected = broadcast.connectedDeviceIds(orgId)
+    return reply.send({
+      devices: devices.rows.map((row: any) => ({ ...row, connected: connected.has(row.id) })),
+    })
   })
 
   /**

@@ -48,4 +48,29 @@ export class HubBroadcaster {
   listenerCount(orgId: string): number {
     return this.emitter.listenerCount(`org:${orgId}`)
   }
+
+  // Which DEVICES hold an open sync stream right now — the ground truth for "is that
+  // machine's daemon connected". Ref-counted, not a set of booleans: one daemon can
+  // briefly hold two streams during a reconnect, and the first teardown must not mark
+  // a device offline while its replacement stream is already live.
+  private readonly liveDevices = new Map<string, Map<string, number>>()
+
+  attachDevice(orgId: string, deviceId: string): () => void {
+    let org = this.liveDevices.get(orgId)
+    if (!org) this.liveDevices.set(orgId, org = new Map())
+    org.set(deviceId, (org.get(deviceId) ?? 0) + 1)
+    let detached = false
+    return () => {
+      if (detached) return
+      detached = true
+      const count = org!.get(deviceId) ?? 0
+      if (count <= 1) org!.delete(deviceId)
+      else org!.set(deviceId, count - 1)
+      if (org!.size === 0) this.liveDevices.delete(orgId)
+    }
+  }
+
+  connectedDeviceIds(orgId: string): Set<string> {
+    return new Set(this.liveDevices.get(orgId)?.keys() ?? [])
+  }
 }
