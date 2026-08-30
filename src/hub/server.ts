@@ -4,6 +4,15 @@ import { hubOpsPlugin } from './routes/ops.js'
 import { hubSyncPlugin } from './routes/sync.js'
 import { HubBroadcaster } from './broadcast.js'
 import { verifyDeviceToken, DEVICE_TOKEN_PREFIX, type HubDevice } from './devices.js'
+import {
+  CLI_TOKEN_PREFIX,
+  approveCliAuth,
+  exchangeCliAuth,
+  listUserOrgs,
+  requireCliMembership,
+  startCliAuth,
+  verifyCliToken,
+} from './cli-auth.js'
 import { verifyClerkToken, resolveOrgForClerk } from './clerk.js'
 import { hubClerkWebhookPlugin } from './webhooks/clerk.js'
 import { hubStripeWebhookPlugin, type StripeWebhookClient } from './webhooks/stripe.js'
@@ -13,6 +22,7 @@ import { mintDeviceToken, revokeDevice } from './devices.js'
 import { createProject, listBoards } from './projects.js'
 import { HubError, ValidationError, ForbiddenError, NotFoundError } from './errors.js'
 import { registerHubCors } from './cors.js'
+import { requireOrgScope } from './scope.js'
 import type { HubSqlPool } from './sql.js'
 
 declare module 'fastify' {
@@ -21,6 +31,13 @@ declare module 'fastify' {
     hubOrgId: string | null
     /** Set for a Clerk-authenticated browser request; null for a device token. */
     hubUserId: string | null
+    /**
+     * Set only for an `orchestra_cli_v1.` token from a logged-in CLI. Such a token
+     * deliberately leaves `hubOrgId` null, so every org-scoped route rejects it through
+     * `requireHubOrgId` without each route having to know CLI tokens exist. It grants
+     * exactly two things: list my orgs, and mint a device token for an org I belong to.
+     */
+    hubCliUserId: string | null
   }
   interface FastifyInstance {
     /** Exposed for tests that need to assert on subscriber counts / leak-freedom. */
@@ -93,6 +110,7 @@ export function buildHubServer(sql: HubSqlPool, opts: HubServerOptions = {}): Fa
   server.decorateRequest('hubDevice', null)
   server.decorateRequest('hubOrgId', null)
   server.decorateRequest('hubUserId', null)
+  server.decorateRequest('hubCliUserId', null)
 
   // Registered before the auth hook below: @fastify/cors answers preflight
   // OPTIONS requests from its own onRequest hook (registered in call order,
@@ -126,12 +144,41 @@ export function buildHubServer(sql: HubSqlPool, opts: HubServerOptions = {}): Fa
     reply.header('cache-control', 'no-store')
     if (!request.url.startsWith('/api/v1/hub/')) return
 
+    // `start` and `exchange` are the only unauthenticated surface on the hub. They have to
+    // be: the machine calling them has no credential yet — that is the point of logging in.
+    // What protects them instead is that starting a request grants nothing, and exchanging
+    // one requires both a code only an approving human's browser ever saw and a verifier
+    // that never left the CLI. See src/hub/cli-auth.ts.
+    //
+    // `approve` is deliberately NOT in this list. It is the step where a person vouches for
+    // a machine, so it must carry a Clerk session and fall through to the checks below.
+    if (request.url.startsWith('/api/v1/hub/cli/auth/start')
+      || request.url.startsWith('/api/v1/hub/cli/auth/exchange')) return
+
     const header = request.headers.authorization
     const token = typeof header === 'string' && header.startsWith('Bearer ')
       ? header.slice('Bearer '.length).trim()
       : ''
     if (!token) {
       return reply.code(403).send({ error: 'device token is required', code: 'forbidden' })
+    }
+
+    if (token.startsWith(CLI_TOKEN_PREFIX)) {
+      let principal: Awaited<ReturnType<typeof verifyCliToken>>
+      try {
+        principal = await verifyCliToken(sql, token)
+      } catch {
+        // Same collapse as the device and Clerk paths below: "unknown" and "revoked" must
+        // not be distinguishable by response shape.
+        return reply.code(403).send(INVALID_TOKEN_BODY)
+      }
+      request.hubDevice = null
+      request.hubUserId = null
+      // Deliberately left null even when the route names an org: org scope for a CLI token
+      // is resolved per route against the caller's membership, never inferred from the URL.
+      request.hubOrgId = null
+      request.hubCliUserId = principal.userId
+      return
     }
 
     const requestedOrg = (request.params as any)?.orgId
@@ -316,6 +363,77 @@ export function buildHubServer(sql: HubSqlPool, opts: HubServerOptions = {}): Fa
   // entitlements.ts), which would let one paired daemon hand out unlimited further
   // daemons for free. A signed-in member, by contrast, always has exactly one
   // membership row in their own org, which is what the seat cap actually meters.
+  // ---- CLI login (see docs/superpowers/specs/2026-08-30-orchestra-cli-login-design.md) ----
+
+  /** Reserves a login attempt. Grants nothing on its own. */
+  server.post('/api/v1/hub/cli/auth/start', async (request, reply) => {
+    const body = (request.body ?? {}) as Record<string, unknown>
+    const started = await startCliAuth(sql, {
+      challenge: typeof body.challenge === 'string' ? body.challenge : '',
+      label: typeof body.label === 'string' ? body.label : '',
+    })
+    return reply.code(201).send({ request_id: started.id, expires_at: started.expiresAt })
+  })
+
+  /**
+   * The human's approval, from a signed-in browser. Requires a Clerk principal specifically:
+   * this is the step where a person vouches for a machine, so a device or CLI token — neither
+   * of which is a person sitting in front of a browser — must not be able to perform it.
+   */
+  server.post('/api/v1/hub/cli/auth/approve', async (request, reply) => {
+    if (!request.hubUserId) {
+      return reply.code(403).send({ error: 'sign in to approve a CLI login', code: 'forbidden' })
+    }
+    const body = (request.body ?? {}) as Record<string, unknown>
+    const { code } = await approveCliAuth(sql, {
+      requestId: typeof body.request_id === 'string' ? body.request_id : '',
+      userId: request.hubUserId,
+    })
+    return reply.send({ code })
+  })
+
+  /** Trades (code, verifier) for a CLI token. The pair is the credential — see cli-auth.ts. */
+  server.post('/api/v1/hub/cli/auth/exchange', async (request, reply) => {
+    const body = (request.body ?? {}) as Record<string, unknown>
+    const issued = await exchangeCliAuth(sql, {
+      requestId: typeof body.request_id === 'string' ? body.request_id : '',
+      code: typeof body.code === 'string' ? body.code : '',
+      verifier: typeof body.verifier === 'string' ? body.verifier : '',
+    })
+    const user = await sql.query<{ email: string; display_name: string | null }>(
+      'SELECT email, display_name FROM users WHERE id = $1', [issued.userId],
+    )
+    return reply.send({ token: issued.token, user: user.rows[0] ?? null })
+  })
+
+  const requireCliUser = (request: FastifyRequest): string => {
+    if (!request.hubCliUserId) throw new ForbiddenError('a CLI token is required')
+    return request.hubCliUserId
+  }
+
+  /** The list `orchestra org connect` chooses from. */
+  server.get('/api/v1/hub/cli/orgs', async (request, reply) => {
+    return reply.send({ orgs: await listUserOrgs(sql, requireCliUser(request)) })
+  })
+
+  /**
+   * Mint a device token from a logged-in CLI.
+   *
+   * The membership is resolved from the token's user, not taken from the URL, and passed to
+   * `mintDeviceToken` — so this path is metered by exactly the same seat cap as the browser
+   * one. That is what keeps this from becoming the anonymous minting path device tokens are
+   * deliberately forbidden from being (see the `/orgs/:orgId/devices` comment below).
+   */
+  server.post('/api/v1/hub/cli/orgs/:orgId/devices', async (request, reply) => {
+    const userId = requireCliUser(request)
+    const orgId = String((request.params as { orgId?: string }).orgId ?? '')
+    const { membershipId } = await requireCliMembership(sql, userId, orgId)
+    const body = (request.body ?? {}) as Record<string, unknown>
+    const name = typeof body.name === 'string' ? body.name : ''
+    const { device, token } = await mintDeviceToken(sql, { orgId, membershipId, name })
+    return reply.code(201).send({ device, token })
+  })
+
   server.post('/api/v1/hub/orgs/:orgId/devices', async (request, reply) => {
     const orgId = requireHubOrgId(request)
     const { membershipId } = await requireMembership(sql, request, orgId)
@@ -414,9 +532,7 @@ export function buildHubServer(sql: HubSqlPool, opts: HubServerOptions = {}): Fa
 }
 
 function requireHubOrgId(request: FastifyRequest): string {
-  const orgId = request.hubOrgId
-  if (!orgId) throw new ValidationError('org scope was not resolved')
-  return orgId
+  return requireOrgScope(request)
 }
 
 export type HubRole = 'owner' | 'admin' | 'member'

@@ -1,6 +1,7 @@
 import type { FastifyPluginAsync, FastifyPluginOptions } from 'fastify'
 import { readOrgEventsSince } from '../events.js'
 import { ValidationError } from '../errors.js'
+import { requireOrgScope } from '../scope.js'
 import type { HubBroadcaster } from '../broadcast.js'
 import type { HubSqlPool } from '../sql.js'
 import type { HubEvent } from '../types.js'
@@ -88,8 +89,7 @@ export const hubSyncPlugin: FastifyPluginAsync<HubSyncRouteOptions> = async (app
   const heartbeatMs = options.heartbeatMs ?? 25_000
 
   app.get('/orgs/:orgId/sync', async (request, reply) => {
-    const orgId = request.hubOrgId
-    if (!orgId) throw new ValidationError('org scope was not resolved')
+    const orgId = requireOrgScope(request)
 
     const query = (request.query ?? {}) as Record<string, string>
     // Parsed BEFORE anything touches `reply.raw`: a validation error thrown after

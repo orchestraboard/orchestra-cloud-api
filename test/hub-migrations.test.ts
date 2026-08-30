@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest'
 import { PGlite } from '@electric-sql/pglite'
-import { hubMigrate, splitStatements } from '../src/hub/migrations.js'
+import { hubMigrate, splitStatements, HUB_MIGRATIONS } from '../src/hub/migrations.js'
 import type { HubSql, HubSqlConnection, HubSqlPool } from '../src/hub/sql.js'
 
 function pglite(): HubSql {
@@ -77,7 +77,7 @@ describe('hub migrations', () => {
 
     // And a clean retry against a repaired runner applies it in full.
     const retry = await hubMigrate(db)
-    expect(retry).toEqual(['002-hub-work', '003-hub-events', '004-hub-event-seq', '005-hub-entitlements'])
+    expect(retry).toEqual(['002-hub-work', '003-hub-events', '004-hub-event-seq', '005-hub-entitlements', '006-cli-auth'])
   })
 
   it('holds an advisory lock for the whole run and releases it, even on failure', async () => {
@@ -106,8 +106,8 @@ describe('hub migrations', () => {
     expect(await hubMigrate(pool)).toContain('001-hub-core')
     expect(released).toBe(true)
     expect(onConnection.filter((text) => /pg_advisory_lock/.test(text))).toHaveLength(1)
-    expect(onConnection.filter((text) => text === 'BEGIN')).toHaveLength(5)
-    expect(onConnection.filter((text) => text === 'COMMIT')).toHaveLength(5)
+    expect(onConnection.filter((text) => text === 'BEGIN')).toHaveLength(HUB_MIGRATIONS.length)
+    expect(onConnection.filter((text) => text === 'COMMIT')).toHaveLength(HUB_MIGRATIONS.length)
   })
 })
 

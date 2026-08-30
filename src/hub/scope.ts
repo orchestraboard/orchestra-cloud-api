@@ -1,4 +1,4 @@
-import { NotFoundError } from './errors.js'
+import { ForbiddenError, NotFoundError, ValidationError } from './errors.js'
 import type { HubSql } from './sql.js'
 
 /**
@@ -41,4 +41,24 @@ export async function requireOrgEntity(
   )
   if (!result.rows[0]) throw new NotFoundError(`${entity} not found in this org`)
   return true
+}
+
+/**
+ * The single org-scope gate. Every org-scoped route resolves its org through this, so a
+ * principal that has no org scope is refused in one place rather than in each route — and a
+ * route added later is closed by default.
+ *
+ * A CLI token (`orchestra login`) authenticates fine and deliberately carries no org scope:
+ * it exists to list your orgs and connect a daemon, never to read or write an organization's
+ * work. That is a denial, not a malformed request, so it answers 403 rather than 400.
+ */
+export function requireOrgScope(request: {
+  hubOrgId: string | null
+  hubCliUserId?: string | null
+}): string {
+  if (request.hubOrgId) return request.hubOrgId
+  if (request.hubCliUserId) {
+    throw new ForbiddenError('a CLI token cannot read or write organization data; it only connects a daemon')
+  }
+  throw new ValidationError('org scope was not resolved')
 }

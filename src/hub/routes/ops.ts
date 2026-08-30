@@ -1,5 +1,6 @@
 import type { FastifyPluginAsync, FastifyPluginOptions, FastifyRequest } from 'fastify'
 import { claimCard, createCard, moveCard, updateCard } from '../cards.js'
+import { requireOrgScope as requireOrg } from '../scope.js'
 import { assertOrgWritable } from '../entitlements.js'
 import { latestOrgSeq, readOrgEventsSince } from '../events.js'
 import { drainInbox, sendMail } from '../mail.js'
@@ -118,8 +119,4 @@ async function runOp(
   }
 }
 
-function requireOrg(request: FastifyRequest): string {
-  const orgId = request.hubOrgId
-  if (!orgId) throw new ValidationError('org scope was not resolved')
-  return orgId
-}
+
