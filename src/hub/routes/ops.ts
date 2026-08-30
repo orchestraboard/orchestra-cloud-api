@@ -1,5 +1,6 @@
 import type { FastifyPluginAsync, FastifyPluginOptions, FastifyRequest } from 'fastify'
-import { claimCard, createCard, moveCard, updateCard } from '../cards.js'
+import { claimCard, createCard, moveCard, setCardMilestone, updateCard } from '../cards.js'
+import { createMilestone, deleteMilestone, listMilestones, updateMilestone } from '../milestones.js'
 import { requireOrgScope as requireOrg } from '../scope.js'
 import { assertOrgWritable } from '../entitlements.js'
 import { latestOrgSeq, readOrgEventsSince } from '../events.js'
@@ -16,8 +17,9 @@ export interface HubOpsRouteOptions extends FastifyPluginOptions {
 
 /** Every op a daemon can issue. Anything not listed here is a 400, not a 404. */
 const OPS = new Set([
-  'card.create', 'card.update', 'card.move', 'card.claim',
+  'card.create', 'card.update', 'card.move', 'card.claim', 'card.milestone',
   'mail.send', 'agent.register', 'agent.heartbeat',
+  'milestone.create', 'milestone.update', 'milestone.delete',
 ])
 
 /**
@@ -68,6 +70,10 @@ export const hubOpsPlugin: FastifyPluginAsync<HubOpsRouteOptions> = async (app, 
     return reply.send({ agents: await listAgents(sql, requireOrg(request)) })
   })
 
+  app.get('/orgs/:orgId/milestones', async (request, reply) => {
+    return reply.send({ milestones: await listMilestones(sql, requireOrg(request)) })
+  })
+
   app.get('/orgs/:orgId/mail/inbox', async (request, reply) => {
     const orgId = requireOrg(request)
     const agent = (request.query as any)?.agent
@@ -98,6 +104,22 @@ async function runOp(
       })
     case 'card.claim':
       return claimCard(sql, { ...common, cardId: payload.card_id, agent: payload.agent })
+    case 'card.milestone':
+      return setCardMilestone(sql, {
+        ...common, cardId: payload.card_id, expectedVersion: payload.expected_version,
+        milestoneId: typeof payload.milestone_id === 'string' ? payload.milestone_id : null,
+      })
+    case 'milestone.create':
+      return createMilestone(sql, {
+        ...common, boardId: payload.board_id, title: payload.title, description: payload.description,
+      })
+    case 'milestone.update':
+      return updateMilestone(sql, {
+        ...common, milestoneId: payload.milestone_id, expectedVersion: payload.expected_version,
+        title: payload.title, description: payload.description, status: payload.status,
+      })
+    case 'milestone.delete':
+      return deleteMilestone(sql, { ...common, milestoneId: payload.milestone_id })
     case 'mail.send':
       return sendMail(sql, {
         ...common, boardId: payload.board_id, fromAgent: payload.from_agent,

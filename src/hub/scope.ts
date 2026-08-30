@@ -11,6 +11,7 @@ const SCOPED_TABLES = {
   mail: 'mail',
   board: 'boards',
   agent: 'agents',
+  milestone: 'milestones',
 } as const
 
 export type ScopedEntity = keyof typeof SCOPED_TABLES

@@ -2,6 +2,7 @@ export type HubEventKind =
   | 'card.created' | 'card.updated' | 'card.moved' | 'card.claimed'
   | 'mail.sent'
   | 'agent.registered' | 'agent.presence'
+  | 'milestone.created' | 'milestone.updated' | 'milestone.deleted'
 
 export interface HubEvent {
   id: string
@@ -25,6 +26,19 @@ export interface HubCard {
   column: string
   owner_agent: string | null
   paths: string[]
+  milestone_id: string | null
+  version: number
+  created_at: string
+  updated_at: string
+}
+
+export interface HubMilestone {
+  id: string
+  org_id: string
+  board_id: string
+  title: string
+  description: string
+  status: 'open' | 'shipped' | 'dropped'
   version: number
   created_at: string
   updated_at: string

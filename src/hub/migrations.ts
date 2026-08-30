@@ -13,6 +13,7 @@ export const HUB_MIGRATIONS: readonly { id: string; sqlFile: string }[] = [
   { id: '004-hub-event-seq', sqlFile: '004-hub-event-seq.sql' },
   { id: '005-hub-entitlements', sqlFile: '005-hub-entitlements.sql' },
   { id: '006-cli-auth', sqlFile: '006-cli-auth.sql' },
+  { id: '007-hub-milestones', sqlFile: '007-hub-milestones.sql' },
 ]
 
 /**

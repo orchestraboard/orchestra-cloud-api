@@ -1,11 +1,12 @@
 import { randomUUID } from 'node:crypto'
 import { appendOrgEvent, replayIfIdempotent } from './events.js'
 import { ConflictError, NotFoundError, ValidationError } from './errors.js'
+import { requireOrgEntity } from './scope.js'
 import { withTransaction, type HubSql, type HubSqlPool } from './sql.js'
-import { boundedString, optionalBoundedString, positiveInteger, stringList } from './validate.js'
+import { boundedString, emptyableBoundedString, optionalBoundedString, positiveInteger, stringList } from './validate.js'
 import type { HubCard } from './types.js'
 
-const CARD_COLUMNS = new Set(['backlog', 'todo', 'in_progress', 'review', 'done'])
+const CARD_COLUMNS = new Set(['backlog', 'todo', 'in_progress', 'blocked', 'review', 'done'])
 
 export interface CreateCardInput {
   orgId: string; boardId: string; title: string; description?: string
@@ -29,6 +30,11 @@ export interface ClaimCardInput {
   actorDeviceId?: string | null; idempotencyKey?: string | null
 }
 
+export interface SetCardMilestoneInput {
+  orgId: string; cardId: string; expectedVersion: number; milestoneId: string | null
+  actorDeviceId?: string | null; idempotencyKey?: string | null
+}
+
 export async function getCard(sql: HubSql, orgId: string, cardId: string): Promise<HubCard | null> {
   const result = await sql.query<any>('SELECT * FROM cards WHERE org_id = $1 AND id = $2', [orgId, cardId])
   return result.rows[0] ? rowToCard(result.rows[0]) : null
@@ -36,7 +42,7 @@ export async function getCard(sql: HubSql, orgId: string, cardId: string): Promi
 
 export async function createCard(sql: HubSqlPool, input: CreateCardInput): Promise<HubCard> {
   const title = boundedString(input.title, 'title', 200)
-  const description = optionalBoundedString(input.description, 'description', 20_000) ?? ''
+  const description = emptyableBoundedString(input.description, 'description', 20_000) ?? ''
   const paths = stringList(input.paths, 'paths', 50, 400)
 
   return withTransaction(sql, async (tx) => {
@@ -69,7 +75,7 @@ export async function updateCard(sql: HubSqlPool, input: UpdateCardInput): Promi
   const expectedVersion = positiveInteger(input.expectedVersion, 'expected_version')
   const title = optionalBoundedString(input.title, 'title', 200)
   const description = input.description === undefined ? undefined
-    : optionalBoundedString(input.description, 'description', 20_000) ?? ''
+    : emptyableBoundedString(input.description, 'description', 20_000) ?? ''
   const paths = input.paths === undefined ? undefined : stringList(input.paths, 'paths', 50, 400)
 
   return withTransaction(sql, async (tx) => {
@@ -160,6 +166,32 @@ export async function claimCard(sql: HubSqlPool, input: ClaimCardInput): Promise
   })
 }
 
+export async function setCardMilestone(sql: HubSqlPool, input: SetCardMilestoneInput): Promise<HubCard> {
+  const expectedVersion = positiveInteger(input.expectedVersion, 'expected_version')
+
+  return withTransaction(sql, async (tx) => {
+    const replay = await replayIfIdempotent<HubCard>(tx, input.orgId, input.idempotencyKey, 'card.updated')
+    if (replay) return replay
+
+    await requireOrgEntity(tx, input.orgId, 'milestone', input.milestoneId)
+
+    const updated = await tx.query<any>(
+      `UPDATE cards SET milestone_id = $3, version = version + 1, updated_at = now()
+       WHERE org_id = $1 AND id = $2 AND version = $4
+       RETURNING *`,
+      [input.orgId, input.cardId, input.milestoneId, expectedVersion],
+    )
+    if (!updated.rows[0]) await failStaleOrMissing(tx, input.orgId, input.cardId)
+    const card = rowToCard(updated.rows[0])
+
+    await appendOrgEvent(tx, {
+      orgId: input.orgId, kind: 'card.updated', boardId: card.board_id,
+      actorDeviceId: input.actorDeviceId, idempotencyKey: input.idempotencyKey, payload: card,
+    })
+    return card
+  })
+}
+
 /** Zero rows updated means either the card is gone or someone else moved first. */
 async function failStaleOrMissing(tx: HubSql, orgId: string, cardId: string): Promise<never> {
   const current = await getCard(tx, orgId, cardId)
@@ -172,6 +204,7 @@ function rowToCard(row: any): HubCard {
     id: row.id, org_id: row.org_id, board_id: row.board_id, number: Number(row.number),
     title: row.title, description: row.description, column: row.column_name,
     owner_agent: row.owner_agent, paths: Array.isArray(row.paths) ? row.paths : JSON.parse(row.paths ?? '[]'),
+    milestone_id: row.milestone_id ?? null,
     version: Number(row.version), created_at: row.created_at, updated_at: row.updated_at,
   }
 }

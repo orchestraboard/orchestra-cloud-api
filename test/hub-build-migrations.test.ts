@@ -44,7 +44,7 @@ describe('built hub artifact', () => {
     const sql = pglite()
 
     const applied = await built.hubMigrate(sql)
-    expect(applied).toEqual(['001-hub-core', '002-hub-work', '003-hub-events', '004-hub-event-seq', '005-hub-entitlements', '006-cli-auth'])
+    expect(applied).toEqual(['001-hub-core', '002-hub-work', '003-hub-events', '004-hub-event-seq', '005-hub-entitlements', '006-cli-auth', '007-hub-milestones'])
 
     const tables = await sql.query<{ table_name: string }>(
       "SELECT table_name FROM information_schema.tables WHERE table_schema='public' ORDER BY table_name",

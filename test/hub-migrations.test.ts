@@ -77,7 +77,7 @@ describe('hub migrations', () => {
 
     // And a clean retry against a repaired runner applies it in full.
     const retry = await hubMigrate(db)
-    expect(retry).toEqual(['002-hub-work', '003-hub-events', '004-hub-event-seq', '005-hub-entitlements', '006-cli-auth'])
+    expect(retry).toEqual(['002-hub-work', '003-hub-events', '004-hub-event-seq', '005-hub-entitlements', '006-cli-auth', '007-hub-milestones'])
   })
 
   it('holds an advisory lock for the whole run and releases it, even on failure', async () => {
